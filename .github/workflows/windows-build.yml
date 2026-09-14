@@ -1,0 +1,46 @@
+name: Build Windows executable
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'requirements*.txt'
+      - 'build/**'
+      - '.github/workflows/windows-build.yml'
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-build.txt
+
+      - name: Verify AKAZE support
+        shell: pwsh
+        run: |
+          python -c "import cv2,sys; print(cv2.__version__); print('AKAZE:',hasattr(cv2,'AKAZE_create')); sys.exit(0 if hasattr(cv2,'AKAZE_create') else 1)"
+
+      - name: Build executable
+        shell: pwsh
+        run: |
+          python -m PyInstaller --clean --noconfirm --distpath build-output --workpath build-work build/Automated_Multispectral_Alignment.spec
+
+      - name: Upload executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: Automated-Multispectral-Alignment-Windows
+          path: build-output/Automated_Multispectral_Alignment.exe
