@@ -3,16 +3,20 @@ alignment_plan_b.py
 
 Fallback alignment utilities for difficult multispectral image pairs.
 
-Currently implemented:
-- directional_patch_consensus
+Implemented stages:
+- directional patch consensus (Plan B)
+- AKAZE feature translation (Plan C)
+- sequence-aware history-guided residual retry
 
-This module is intended to be used only when the primary alignment method fails.
+Historical geometry is used only after the normal pair estimators reject a result.
 """
 
 import cv2
 import numpy as np
 
 from alignment_core import (
+    DEFAULT_CONFIG,
+    estimate_xy_v4,
     to_gray_float,
     center_crop,
     border_crop,
@@ -55,6 +59,11 @@ DEFAULT_PLAN_B_CONFIG = {
     "DEFAULT_DX_MAX": 250,
     "DEFAULT_DY_MIN": -250,
     "DEFAULT_DY_MAX": 250,
+
+    # history-guided retry
+    "PRIOR_RESIDUAL_WINDOW": 80,
+    "PRIOR_MAX_RESIDUAL": 90,
+    "PRIOR_PRIMARY_REFINE": 35,
 }
 
 
@@ -165,32 +174,42 @@ def choose_reference_patches(ref_g, config=None, max_patches=9):
 
 
 def constrained_patch_search(ref_patch, mov_g, x0, y0, dx_min, dx_max, dy_min, dy_max):
+    """
+    Search a bounded translation window using OpenCV's optimized normalized
+    cross-correlation.  This is mathematically equivalent to evaluating the old
+    per-pixel NCC loop, but avoids tens of thousands of Python-level patch
+    comparisons for every selected patch.
+    """
     ph, pw = ref_patch.shape[:2]
     h, w = mov_g.shape[:2]
 
-    best = {"dx": None, "dy": None, "score": -1e9}
+    valid_dx_min = max(int(dx_min), -int(x0))
+    valid_dx_max = min(int(dx_max), int(w - pw - x0))
+    valid_dy_min = max(int(dy_min), -int(y0))
+    valid_dy_max = min(int(dy_max), int(h - ph - y0))
 
-    for dy in range(dy_min, dy_max + 1):
-        yy0 = y0 + dy
-        yy1 = yy0 + ph
-        if yy0 < 0 or yy1 > h:
-            continue
+    if valid_dx_min > valid_dx_max or valid_dy_min > valid_dy_max:
+        return {"dx": None, "dy": None, "score": -1e9}
 
-        for dx in range(dx_min, dx_max + 1):
-            xx0 = x0 + dx
-            xx1 = xx0 + pw
-            if xx0 < 0 or xx1 > w:
-                continue
+    sx0 = int(x0 + valid_dx_min)
+    sy0 = int(y0 + valid_dy_min)
+    sx1 = int(x0 + valid_dx_max + pw)
+    sy1 = int(y0 + valid_dy_max + ph)
 
-            mov_patch = mov_g[yy0:yy1, xx0:xx1]
-            score = ncc_score(ref_patch, mov_patch)
+    search_region = mov_g[sy0:sy1, sx0:sx1].astype(np.float32, copy=False)
+    template = ref_patch.astype(np.float32, copy=False)
 
-            if score > best["score"]:
-                best["dx"] = dx
-                best["dy"] = dy
-                best["score"] = score
+    if search_region.shape[0] < ph or search_region.shape[1] < pw:
+        return {"dx": None, "dy": None, "score": -1e9}
 
-    return best
+    scores = cv2.matchTemplate(search_region, template, cv2.TM_CCOEFF_NORMED)
+    _, max_score, _, max_loc = cv2.minMaxLoc(scores)
+
+    return {
+        "dx": int(valid_dx_min + max_loc[0]),
+        "dy": int(valid_dy_min + max_loc[1]),
+        "score": float(max_score),
+    }
 
 
 def robust_vote_fusion(votes, config=None):
@@ -214,9 +233,12 @@ def robust_vote_fusion(votes, config=None):
     if not inliers:
         return None
 
-    weights = np.array([max(v["score"], 0.001) for v in inliers], dtype=np.float32)
-    dx_final = int(round(np.average([v["dx"] for v in inliers], weights=weights)))
-    dy_final = int(round(np.average([v["dy"] for v in inliers], weights=weights)))
+    # Use the median translation of the spatially consistent patches.  A
+    # weighted mean can be pulled toward a single high-NCC but geometrically
+    # misleading patch (for example a repetitive texture).  The median is much
+    # more stable for fixed multi-lens geometry.
+    dx_final = int(round(float(np.median([v["dx"] for v in inliers]))))
+    dy_final = int(round(float(np.median([v["dy"] for v in inliers]))))
     score_final = float(np.mean([v["score"] for v in inliers]))
 
     return {
@@ -438,14 +460,286 @@ def directional_patch_consensus(ref_img, mov_img, pair_hint=None, config=None):
     return last_result
 
 
-def estimate_xy_plan_b(ref_img, mov_img, pair_hint=None, config=None):
+def _result_summary(result, label):
+    """Create a compact diagnostic message without hiding a later fallback result."""
+    if result is None:
+        return f"{label}=no_result"
+
+    support = int(result.get("support", 0))
+    score = float(result.get("score", result.get("confidence", 0.0)))
+    details = result.get("details", {}) or {}
+    residual = details.get("mean_residual")
+
+    extra = ""
+    if residual is not None:
+        extra = f", mean_residual={float(residual):.2f}"
+
+    return (
+        f"{label}={'accepted' if result.get('accepted') else 'rejected'}"
+        f"(support={support}, score={score:.4f}{extra})"
+    )
+
+
+def _translate_for_retry(img, apply_dx, apply_dy):
+    """Translate an image for a prior-guided residual-alignment retry."""
+    h, w = img.shape[:2]
+    matrix = np.float32([[1, 0, float(apply_dx)], [0, 1, float(apply_dy)]])
+    return cv2.warpAffine(
+        img,
+        matrix,
+        (w, h),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
+
+
+def _residual_is_plausible(result, config=None):
+    if result is None or not result.get("accepted"):
+        return False
+
+    max_residual = int(_cfg(config, "PRIOR_MAX_RESIDUAL"))
+    return (
+        abs(int(result.get("dx", 0))) <= max_residual
+        and abs(int(result.get("dy", 0))) <= max_residual
+    )
+
+
+def _combine_with_prior(result, prior_shift, method_name):
+    """Convert a residual result back into the original pair coordinate system."""
+    prior_dx = int(round(float(prior_shift["dx"])))
+    prior_dy = int(round(float(prior_shift["dy"])))
+    residual_dx = int(result["dx"])
+    residual_dy = int(result["dy"])
+
+    details = dict(result.get("details", {}) or {})
+    details.update({
+        "prior_dx": prior_dx,
+        "prior_dy": prior_dy,
+        "prior_samples": int(prior_shift.get("samples", 0)),
+        "prior_mad_dx": float(prior_shift.get("mad_dx", 0.0)),
+        "prior_mad_dy": float(prior_shift.get("mad_dy", 0.0)),
+        "residual_dx": residual_dx,
+        "residual_dy": residual_dy,
+        "source_method": str(result.get("method", "primary")),
+    })
+
+    if "num_votes" in result:
+        details.setdefault("num_votes", int(result["num_votes"]))
+
+    return {
+        "dx": prior_dx + residual_dx,
+        "dy": prior_dy + residual_dy,
+        "score": float(result.get("score", result.get("confidence", 0.0))),
+        "support": int(result.get("support", 0)),
+        "accepted": True,
+        "method": method_name,
+        "details": details,
+    }
+
+
+def prior_guided_retry(ref_img, mov_img, prior_shift, config=None):
+    """
+    Re-run all three alignment strategies around a historical pair shift.
+
+    The moving image is first translated by the inverse of the historical raw
+    shift.  The remaining alignment should therefore be a small residual around
+    zero.  We then try:
+
+    A. phase/patch primary estimator
+    B. directional patch consensus in a narrow residual window
+    C. AKAZE feature translation
+
+    Only a strictly accepted residual result is combined with the historical
+    prior.  The original acceptance thresholds are intentionally not relaxed.
+    """
+    if not prior_shift:
+        return None
+
+    prior_dx = int(round(float(prior_shift["dx"])))
+    prior_dy = int(round(float(prior_shift["dy"])))
+
+    _debug(
+        config,
+        f"    history prior -> dx={prior_dx}, dy={prior_dy}, "
+        f"samples={int(prior_shift.get('samples', 0))}"
+    )
+
+    # raw shift describes moving relative to reference; apply its inverse first.
+    shifted_mov = _translate_for_retry(mov_img, -prior_dx, -prior_dy)
+
+    # Plan A again, now around residual ~= (0, 0).
+    primary_config = DEFAULT_CONFIG.copy()
+    primary_config.update({
+        "REFINE_DX": int(_cfg(config, "PRIOR_PRIMARY_REFINE")),
+        "REFINE_DY": int(_cfg(config, "PRIOR_PRIMARY_REFINE")),
+        "PRINT_DEBUG": bool(_cfg(config, "PRINT_DEBUG")),
+    })
+    primary_result = estimate_xy_v4(ref_img, shifted_mov, config=primary_config)
+    if _residual_is_plausible(primary_result, config=config):
+        return _combine_with_prior(
+            primary_result,
+            prior_shift,
+            "history_prior_phase_patch_consensus",
+        )
+
+    # Plan B again, but search only a small residual window around zero.
+    residual_window = int(_cfg(config, "PRIOR_RESIDUAL_WINDOW"))
+    residual_config = dict(config or {})
+    residual_config.update({
+        "DEFAULT_DX_MIN": -residual_window,
+        "DEFAULT_DX_MAX": residual_window,
+        "DEFAULT_DY_MIN": -residual_window,
+        "DEFAULT_DY_MAX": residual_window,
+    })
+    patch_result = directional_patch_consensus(
+        ref_img,
+        shifted_mov,
+        pair_hint=None,
+        config=residual_config,
+    )
+    if _residual_is_plausible(patch_result, config=config):
+        return _combine_with_prior(
+            patch_result,
+            prior_shift,
+            "history_prior_directional_patch_consensus",
+        )
+
+    # Plan C again. Its strict residual-quality threshold is preserved.
+    feature_result = feature_ransac_translation(
+        ref_img,
+        shifted_mov,
+        config=config,
+    )
+    if _residual_is_plausible(feature_result, config=config):
+        return _combine_with_prior(
+            feature_result,
+            prior_shift,
+            "history_prior_feature_ransac_translation",
+        )
+
+    # A strict historical prior lets us use agreement between independent weak
+    # estimators without loosening any individual estimator's normal threshold.
+    # This is intentionally enabled only when at least three prior successful
+    # frames support the same physical lens geometry.
+    prior_samples = int(prior_shift.get("samples", 0))
+    prior_spread = max(
+        float(prior_shift.get("mad_dx", 0.0)),
+        float(prior_shift.get("mad_dy", 0.0)),
+    )
+    if prior_samples >= 3 and prior_spread <= 10.0:
+        candidates = []
+
+        if primary_result is not None:
+            phase_response = float(primary_result.get("confidence", 0.0))
+            if phase_response >= 0.025:
+                candidates.append((
+                    "A",
+                    int(primary_result.get("dx", 0)),
+                    int(primary_result.get("dy", 0)),
+                    phase_response,
+                ))
+
+        if patch_result is not None:
+            if (
+                int(patch_result.get("support", 0)) >= 2
+                and float(patch_result.get("score", 0.0)) >= 0.25
+            ):
+                candidates.append((
+                    "B",
+                    int(patch_result.get("dx", 0)),
+                    int(patch_result.get("dy", 0)),
+                    float(patch_result.get("score", 0.0)),
+                ))
+
+        if feature_result is not None:
+            feature_details = feature_result.get("details", {}) or {}
+            if (
+                int(feature_result.get("support", 0)) >= 10
+                and float(feature_details.get("mean_residual", 1e9)) <= 12.0
+            ):
+                candidates.append((
+                    "C",
+                    int(feature_result.get("dx", 0)),
+                    int(feature_result.get("dy", 0)),
+                    float(feature_result.get("score", 0.0)),
+                ))
+
+        if len(candidates) >= 2:
+            residual_dxs = np.asarray([c[1] for c in candidates], dtype=np.float32)
+            residual_dys = np.asarray([c[2] for c in candidates], dtype=np.float32)
+            med_dx = int(round(float(np.median(residual_dxs))))
+            med_dy = int(round(float(np.median(residual_dys))))
+
+            agreeing = [
+                c for c in candidates
+                if abs(c[1] - med_dx) <= 6 and abs(c[2] - med_dy) <= 6
+            ]
+
+            if len(agreeing) >= 2 and abs(med_dx) <= 20 and abs(med_dy) <= 20:
+                agreement_score = float(np.mean([c[3] for c in agreeing]))
+                combined = {
+                    "dx": med_dx,
+                    "dy": med_dy,
+                    "score": agreement_score,
+                    "support": len(agreeing),
+                    "accepted": True,
+                    "method": "cross_method_consensus",
+                    "details": {
+                        "agreeing_methods": [c[0] for c in agreeing],
+                        "candidate_residuals": [
+                            {"method": c[0], "dx": c[1], "dy": c[2], "score": c[3]}
+                            for c in candidates
+                        ],
+                    },
+                }
+                return _combine_with_prior(
+                    combined,
+                    prior_shift,
+                    "history_prior_cross_method_consensus",
+                )
+
+    if _cfg(config, "PRINT_DEBUG"):
+        print("\n[HISTORY PRIOR RETRY RESULT]")
+        print({
+            "prior": prior_shift,
+            "primary_result": primary_result,
+            "patch_result": patch_result,
+            "feature_result": feature_result,
+        })
+
+    return {
+        "dx": prior_dx,
+        "dy": prior_dy,
+        "score": 0.0,
+        "support": 0,
+        "accepted": False,
+        "method": "history_prior_retry_failed",
+        "reason": "; ".join([
+            _result_summary(primary_result, "A"),
+            _result_summary(patch_result, "B"),
+            _result_summary(feature_result, "C"),
+        ]),
+        "details": {
+            "prior_dx": prior_dx,
+            "prior_dy": prior_dy,
+            "prior_samples": int(prior_shift.get("samples", 0)),
+            "primary_result": primary_result,
+            "patch_result": patch_result,
+            "feature_result": feature_result,
+        },
+    }
+
+
+def estimate_xy_plan_b(ref_img, mov_img, pair_hint=None, config=None, prior_shift=None):
     """
     Fallback alignment order:
 
     1. Directional patch consensus (Plan B)
-    2. Feature-based AKAZE/RANSAC translation (Plan C)
+    2. Feature-based AKAZE translation (Plan C)
+    3. If both fail and history is available, pre-shift by the robust historical
+       pair displacement and re-run Plan A, Plan B and Plan C on the residual.
     """
-
     patch_result = directional_patch_consensus(
         ref_img,
         mov_img,
@@ -453,7 +747,7 @@ def estimate_xy_plan_b(ref_img, mov_img, pair_hint=None, config=None):
         config=config,
     )
 
-    if patch_result is not None and patch_result["accepted"]:
+    if patch_result is not None and patch_result.get("accepted"):
         if _cfg(config, "PRINT_DEBUG"):
             print("\n[PLAN B RESULT]")
             print(patch_result)
@@ -472,7 +766,35 @@ def estimate_xy_plan_b(ref_img, mov_img, pair_hint=None, config=None):
             "feature_result": feature_result,
         })
 
-    if feature_result is not None and feature_result["accepted"]:
+    if feature_result is not None and feature_result.get("accepted"):
         return feature_result
 
-    return patch_result
+    if prior_shift is not None:
+        prior_result = prior_guided_retry(
+            ref_img,
+            mov_img,
+            prior_shift=prior_shift,
+            config=config,
+        )
+        if prior_result is not None and prior_result.get("accepted"):
+            return prior_result
+        if prior_result is not None:
+            return prior_result
+
+    # Preserve both failure diagnostics; do not hide Plan C behind Plan B.
+    return {
+        "dx": int((patch_result or feature_result or {}).get("dx", 0)),
+        "dy": int((patch_result or feature_result or {}).get("dy", 0)),
+        "score": float((feature_result or patch_result or {}).get("score", 0.0)),
+        "support": int((feature_result or patch_result or {}).get("support", 0)),
+        "accepted": False,
+        "method": "plan_b_and_c_failed",
+        "reason": "; ".join([
+            _result_summary(patch_result, "B"),
+            _result_summary(feature_result, "C"),
+        ]),
+        "details": {
+            "patch_result": patch_result,
+            "feature_result": feature_result,
+        },
+    }

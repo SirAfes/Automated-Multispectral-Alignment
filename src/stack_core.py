@@ -18,6 +18,7 @@ Plan B does NOT use 1 -> 3.
 from pathlib import Path
 import csv
 import cv2
+import numpy as np
 import tifffile
 
 from alignment_core import estimate_xy_v4, DEFAULT_CONFIG
@@ -39,6 +40,10 @@ OUTPUT_ORDER = [
     "630", "650", "685", "710",
     "735", "850",
 ]
+
+# Stable pair geometry used by the 2/5-centered fallback layout.
+# Historical priors are kept separately for every physical lens pair.
+HISTORY_PAIRS = ((2, 1), (2, 3), (2, 5), (5, 4), (5, 6))
 
 
 def load_split_images(split_dir: Path):
@@ -76,39 +81,48 @@ def estimate_pair_primary(ref_img, mov_img, config=None):
     }
 
 
-def estimate_pair_plan_b(ref_img, mov_img, pair_hint):
+def estimate_pair_plan_b(ref_img, mov_img, pair_hint, prior_shift=None):
     result = estimate_xy_plan_b(
         ref_img,
         mov_img,
         pair_hint=pair_hint,
         config=None,
+        prior_shift=prior_shift,
     )
 
-    if result is None or not result["accepted"]:
-        reason = "none" if result is None else f"{result['method']} rejected"
-        raise RuntimeError(reason)
+    pair_label = f"{pair_hint[0]}->{pair_hint[1]}"
+    if result is None or not result.get("accepted"):
+        if result is None:
+            reason = "no alignment result"
+        else:
+            reason = result.get("reason", f"{result.get('method', 'unknown')} rejected")
+        raise RuntimeError(f"{pair_label}: {reason}")
 
     raw_dx = int(result["dx"])
     raw_dy = int(result["dy"])
 
+    details = result.get("details", {}) or {}
     num_votes = int(
-        result["details"].get(
+        details.get(
             "num_votes",
-            result["details"].get("matches", result["support"]),
+            details.get("matches", result.get("support", 0)),
         )
     )
 
+    algorithm = str(result.get("method", "plan_b"))
     return {
         "raw_dx": raw_dx,
         "raw_dy": raw_dy,
         "apply_dx": -raw_dx,
         "apply_dy": -raw_dy,
-        "confidence": float(result["score"]),
-        "support": int(result["support"]),
+        "confidence": float(result.get("score", 0.0)),
+        "support": int(result.get("support", 0)),
         "num_votes": num_votes,
-        "reason": f"plan_b:{result['method']}",
-        "method": "plan_b",
-        "algorithm": str(result["method"]),
+        "reason": f"fallback:{algorithm}",
+        "method": "history_retry" if algorithm.startswith("history_prior_") else "plan_b",
+        "algorithm": algorithm,
+        "history_prior_used": bool(algorithm.startswith("history_prior_")),
+        "details": details,
     }
 
 
@@ -154,9 +168,12 @@ def compute_primary_alignment(images, config=None):
     }
 
 
-def compute_plan_b_alignment(images):
+def compute_plan_b_alignment(images, alignment_priors=None):
     """
-    Plan B layout:
+    2/5-centered fallback layout.  If a pair has a robust historical prior,
+    that prior is used only after the normal Plan B and Plan C attempts fail.
+
+    Layout:
         2 -> 1
         2 -> 3
         2 -> 5
@@ -167,12 +184,26 @@ def compute_plan_b_alignment(images):
         image 2 = (0, 0)
     """
     pairs = {}
+    alignment_priors = alignment_priors or {}
 
-    pairs["2-1"] = estimate_pair_plan_b(images[2], images[1], pair_hint=(2, 1))
-    pairs["2-3"] = estimate_pair_plan_b(images[2], images[3], pair_hint=(2, 3))
-    pairs["2-5"] = estimate_pair_plan_b(images[2], images[5], pair_hint=(2, 5))
-    pairs["5-4"] = estimate_pair_plan_b(images[5], images[4], pair_hint=(5, 4))
-    pairs["5-6"] = estimate_pair_plan_b(images[5], images[6], pair_hint=(5, 6))
+    def prior_for(pair_hint):
+        return alignment_priors.get(pair_hint)
+
+    pairs["2-1"] = estimate_pair_plan_b(
+        images[2], images[1], pair_hint=(2, 1), prior_shift=prior_for((2, 1))
+    )
+    pairs["2-3"] = estimate_pair_plan_b(
+        images[2], images[3], pair_hint=(2, 3), prior_shift=prior_for((2, 3))
+    )
+    pairs["2-5"] = estimate_pair_plan_b(
+        images[2], images[5], pair_hint=(2, 5), prior_shift=prior_for((2, 5))
+    )
+    pairs["5-4"] = estimate_pair_plan_b(
+        images[5], images[4], pair_hint=(5, 4), prior_shift=prior_for((5, 4))
+    )
+    pairs["5-6"] = estimate_pair_plan_b(
+        images[5], images[6], pair_hint=(5, 6), prior_shift=prior_for((5, 6))
+    )
 
     apply_shifts = {
         2: {"dx": 0, "dy": 0},
@@ -211,13 +242,107 @@ def compute_plan_b_alignment(images):
         "pairs": pairs,
         "raw_shifts": raw_shifts,
         "apply_shifts": apply_shifts,
+        "history_priors_available": len(alignment_priors),
+        "history_retry_used": any(
+            pair.get("history_prior_used", False) for pair in pairs.values()
+        ),
     }
 
 
-def estimate_alignment_from_split(split_dir: Path, config=None):
+def derive_history_pair_shifts(alignment_result):
     """
-    First try the old primary alignment.
-    If any pair fails, switch completely to Plan B layout.
+    Derive raw relative shifts for the fixed fallback lens pairs from any
+    successful alignment mode.  This means primary-mode successes can teach the
+    fallback layout even though they used image 1 as their global reference.
+    """
+    apply_shifts = alignment_result.get("apply_shifts", {})
+    pair_shifts = {}
+
+    for ref_id, mov_id in HISTORY_PAIRS:
+        if ref_id not in apply_shifts or mov_id not in apply_shifts:
+            continue
+
+        # raw(ref->mov) = global_raw_mov - global_raw_ref
+        #                  = apply_ref - apply_mov
+        pair_shifts[(ref_id, mov_id)] = {
+            "dx": int(apply_shifts[ref_id]["dx"] - apply_shifts[mov_id]["dx"]),
+            "dy": int(apply_shifts[ref_id]["dy"] - apply_shifts[mov_id]["dy"]),
+        }
+
+    return pair_shifts
+
+
+def _robust_prior(values):
+    """Return a robust median/MAD prior while rejecting obvious history outliers."""
+    if not values:
+        return None
+
+    dxs = np.asarray([v["dx"] for v in values], dtype=np.float32)
+    dys = np.asarray([v["dy"] for v in values], dtype=np.float32)
+
+    med_dx = float(np.median(dxs))
+    med_dy = float(np.median(dys))
+    mad_dx = float(np.median(np.abs(dxs - med_dx)))
+    mad_dy = float(np.median(np.abs(dys - med_dy)))
+
+    # At least 12 px is allowed because close-range parallax can alter the best
+    # translation slightly even though the physical lens geometry is fixed.
+    tol_dx = max(12.0, 4.0 * 1.4826 * mad_dx)
+    tol_dy = max(12.0, 4.0 * 1.4826 * mad_dy)
+    keep = (np.abs(dxs - med_dx) <= tol_dx) & (np.abs(dys - med_dy) <= tol_dy)
+
+    filtered_dx = dxs[keep] if np.any(keep) else dxs
+    filtered_dy = dys[keep] if np.any(keep) else dys
+
+    final_dx = float(np.median(filtered_dx))
+    final_dy = float(np.median(filtered_dy))
+    final_mad_dx = float(np.median(np.abs(filtered_dx - final_dx)))
+    final_mad_dy = float(np.median(np.abs(filtered_dy - final_dy)))
+
+    return {
+        "dx": int(round(final_dx)),
+        "dy": int(round(final_dy)),
+        "samples": int(len(filtered_dx)),
+        "source_samples": int(len(values)),
+        "mad_dx": final_mad_dx,
+        "mad_dy": final_mad_dy,
+    }
+
+
+def build_alignment_priors(alignment_results, max_samples=5):
+    """
+    Build pair-specific priors from up to the supplied successful alignments.
+    The caller controls temporal/neighbour selection; this function performs the
+    robust aggregation only.
+    """
+    if not alignment_results:
+        return {}
+
+    selected = list(alignment_results)[-max_samples:]
+    buckets = {pair: [] for pair in HISTORY_PAIRS}
+
+    for alignment in selected:
+        for pair, shift in derive_history_pair_shifts(alignment).items():
+            buckets[pair].append(shift)
+
+    priors = {}
+    for pair, values in buckets.items():
+        prior = _robust_prior(values)
+        if prior is not None:
+            priors[pair] = prior
+
+    return priors
+
+
+def estimate_alignment_from_split(
+    split_dir: Path,
+    config=None,
+    alignment_priors=None,
+):
+    """
+    Try the primary direct-reference alignment first.  If any pair fails, switch
+    completely to the 2/5-centered fallback layout.  Normal fallback methods are
+    always attempted before historical priors are allowed to influence a pair.
     """
     if config is None:
         config = DEFAULT_CONFIG.copy()
@@ -226,12 +351,23 @@ def estimate_alignment_from_split(split_dir: Path, config=None):
 
     try:
         print("Trying primary alignment...")
-        return compute_primary_alignment(images, config=config)
+        result = compute_primary_alignment(images, config=config)
+        result["history_priors_available"] = len(alignment_priors or {})
+        result["history_retry_used"] = False
+        return result
 
     except Exception as e:
         print(f"Primary alignment failed: {e}")
-        print("Switching to Plan B 2/5-centered alignment...")
-        return compute_plan_b_alignment(images)
+        print("Switching to Plan B/C 2/5-centered alignment...")
+        if alignment_priors:
+            print(
+                f"Historical lens geometry available for "
+                f"{len(alignment_priors)} pair(s)."
+            )
+        return compute_plan_b_alignment(
+            images,
+            alignment_priors=alignment_priors,
+        )
 
 
 def build_band_map():
@@ -254,10 +390,27 @@ def classify_alignment_quality(pair_result):
     support = int(pair_result.get("support", 0))
     algorithm = pair_result.get("algorithm", pair_result.get("method", ""))
 
-    if algorithm == "feature_ransac_translation":
+    if algorithm in {
+        "feature_ransac_translation",
+        "history_prior_feature_ransac_translation",
+    }:
         if support >= 20:
             return "high"
         if support >= 6:
+            return "medium"
+        return "low"
+
+    if algorithm == "history_prior_cross_method_consensus":
+        details = pair_result.get("details", {}) or {}
+        agreeing = details.get("agreeing_methods", [])
+        prior_samples = int(details.get("prior_samples", 0))
+        residual_mag = float(np.hypot(
+            details.get("residual_dx", 0),
+            details.get("residual_dy", 0),
+        ))
+        if len(agreeing) >= 3 and prior_samples >= 3 and residual_mag <= 5.0:
+            return "high"
+        if len(agreeing) >= 2 and prior_samples >= 3 and residual_mag <= 10.0:
             return "medium"
         return "low"
 
@@ -272,6 +425,7 @@ def summarize_alignment_quality(alignment_result):
     rows = []
 
     for pair_name, pair in alignment_result.get("pairs", {}).items():
+        details = pair.get("details", {}) or {}
         rows.append({
             "pair": pair_name,
             "method": pair.get("method", ""),
@@ -284,6 +438,10 @@ def summarize_alignment_quality(alignment_result):
             "raw_dy": int(pair.get("raw_dy", 0)),
             "apply_dx": int(pair.get("apply_dx", 0)),
             "apply_dy": int(pair.get("apply_dy", 0)),
+            "history_prior_used": bool(pair.get("history_prior_used", False)),
+            "prior_samples": int(details.get("prior_samples", 0)),
+            "residual_dx": int(details.get("residual_dx", 0)),
+            "residual_dy": int(details.get("residual_dy", 0)),
             "reason": pair.get("reason", ""),
         })
 
@@ -323,20 +481,27 @@ def write_alignment_quality_report(output_tiff: Path, export_result):
     ]
 
     for row in summary["rows"]:
+        history_note = ""
+        if row["history_prior_used"]:
+            history_note = (
+                f", history_prior=yes(samples={row['prior_samples']}, "
+                f"residual=({row['residual_dx']}, {row['residual_dy']}))"
+            )
         lines.append(
             f"- {row['pair']}: quality={row['quality']}, "
             f"method={row['method']}, algorithm={row['algorithm']}, "
             f"confidence={row['confidence']:.4f}, support={row['support']}/{row['num_votes']}, "
             f"raw_shift=({row['raw_dx']}, {row['raw_dy']}), "
-            f"applied_shift=({row['apply_dx']}, {row['apply_dy']}), "
-            f"reason={row['reason']}"
+            f"applied_shift=({row['apply_dx']}, {row['apply_dy']})"
+            f"{history_note}, reason={row['reason']}"
         )
 
     txt_path.write_text("\n".join(lines), encoding="utf-8")
 
     fieldnames = [
         "pair", "method", "algorithm", "quality", "confidence",
-        "support", "num_votes", "raw_dx", "raw_dy", "apply_dx", "apply_dy", "reason",
+        "support", "num_votes", "raw_dx", "raw_dy", "apply_dx", "apply_dy",
+        "history_prior_used", "prior_samples", "residual_dx", "residual_dy", "reason",
     ]
     with csv_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -350,8 +515,17 @@ def export_multipage_tiff_from_split(
     split_dir: Path,
     output_tiff: Path,
     config=None,
+    alignment_priors=None,
+    status_callback=None,
 ):
-    alignment_result = estimate_alignment_from_split(split_dir, config=config)
+    if status_callback:
+        status_callback("Aligning lens images")
+
+    alignment_result = estimate_alignment_from_split(
+        split_dir,
+        config=config,
+        alignment_priors=alignment_priors,
+    )
     apply_shifts = alignment_result["apply_shifts"]
 
     print(f"Alignment mode: {alignment_result['mode']}")
@@ -417,6 +591,9 @@ def export_multipage_tiff_from_split(
     band_map = build_band_map()
     output_tiff.parent.mkdir(parents=True, exist_ok=True)
 
+    if status_callback:
+        status_callback("Writing aligned 14-band TIFF")
+
     with tifffile.TiffWriter(str(output_tiff)) as tif:
         for band_name in OUTPUT_ORDER:
             file_id, ch_idx = band_map[band_name]
@@ -435,6 +612,9 @@ def export_multipage_tiff_from_split(
         "final_size": {"width": x1 - x0, "height": y1 - y0},
         "output_tiff": str(output_tiff),
     }
+
+    if status_callback:
+        status_callback("Writing alignment quality report")
 
     export_result["quality_report"] = write_alignment_quality_report(
         output_tiff=output_tiff,
