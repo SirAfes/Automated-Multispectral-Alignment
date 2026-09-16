@@ -7,6 +7,7 @@ import queue
 import threading
 import time
 import traceback
+import shutil
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -51,21 +52,58 @@ def process_single_file(
     reuse_split: bool = False,
     status_callback=None,
 ):
-    """Process one source image completely and return its alignment metadata."""
+    """
+    Process one source image completely.
+
+    Output is written to two locations:
+
+    1. Normal per-image processing folder:
+       <raw_folder>/<image_name>/<image_name>_aligned_multiband.tif
+
+    2. Shared TIFF collection folder:
+       <raw_folder>/tiff/<image_name>_aligned_multiband.tif
+    """
+
+    # ---------------------------------------------------------
+    # OUTPUT PATHS
+    # ---------------------------------------------------------
     base_output_dir = input_path.parent / input_path.stem
+
     split_dir = base_output_dir / "split_lens_images"
-    output_tiff = base_output_dir / f"{input_path.stem}_aligned_multiband.tif"
+
+    output_tiff = (
+        base_output_dir
+        / f"{input_path.stem}_aligned_multiband.tif"
+    )
+
+    # Shared TIFF folder beside the original RAW/source images
+    shared_tiff_dir = input_path.parent / "tiff"
+
+    shared_tiff_path = (
+        shared_tiff_dir
+        / f"{input_path.stem}_aligned_multiband.tif"
+    )
 
     print(f"\n=== Processing: {input_path.name} ===")
     print(f"Output folder: {base_output_dir}")
 
+    # ---------------------------------------------------------
+    # SPLIT COMPOUND IMAGE
+    # ---------------------------------------------------------
     if reuse_split and _split_set_is_complete(split_dir):
+
         if status_callback:
             status_callback("Using existing six lens images")
+
         print("Using existing split lens images.")
+
     else:
+
         if status_callback:
-            status_callback("Splitting compound image into six lens images")
+            status_callback(
+                "Splitting compound image into six lens images"
+            )
+
         split_compound_image(
             input_image=input_path,
             output_dir=split_dir,
@@ -73,8 +111,12 @@ def process_single_file(
             save_ext=SAVE_EXT,
             jpeg_quality=JPEG_QUALITY,
         )
+
         print("Split completed.")
 
+    # ---------------------------------------------------------
+    # ALIGNMENT + TIFF EXPORT
+    # ---------------------------------------------------------
     export_result = export_multipage_tiff_from_split(
         split_dir=split_dir,
         output_tiff=output_tiff,
@@ -82,24 +124,79 @@ def process_single_file(
         status_callback=status_callback,
     )
 
-    quality_report = export_result.get("quality_report", {})
-    quality_summary = quality_report.get("summary", {})
+    # ---------------------------------------------------------
+    # COPY FINAL TIFF TO SHARED /tiff FOLDER
+    # ---------------------------------------------------------
+    if status_callback:
+        status_callback("Copying final TIFF to collection folder")
 
-    print("TIFF export completed.")
-    print(
-        f"Final TIFF: {output_tiff.name} | "
-        f"size={export_result['final_size']['width']}x{export_result['final_size']['height']}"
+    shared_tiff_dir.mkdir(
+        parents=True,
+        exist_ok=True,
     )
 
+    # copy2 preserves file metadata where possible.
+    # Existing TIFF with the same name is overwritten.
+    shutil.copy2(
+        output_tiff,
+        shared_tiff_path,
+    )
+
+    print(f"TIFF collection copy: {shared_tiff_path}")
+
+    # ---------------------------------------------------------
+    # QUALITY INFORMATION
+    # ---------------------------------------------------------
+    quality_report = export_result.get(
+        "quality_report",
+        {},
+    )
+
+    quality_summary = quality_report.get(
+        "summary",
+        {},
+    )
+
+    print("TIFF export completed.")
+
+    print(
+        f"Final TIFF: {output_tiff.name} | "
+        f"size="
+        f"{export_result['final_size']['width']}x"
+        f"{export_result['final_size']['height']}"
+    )
+
+    # ---------------------------------------------------------
+    # RESULT
+    # ---------------------------------------------------------
     return {
         "input": str(input_path),
+
         "output_dir": str(base_output_dir),
+
+        # Original TIFF inside the individual processing folder
         "tiff": str(output_tiff),
-        "quality_report": quality_report.get("txt", ""),
-        "quality": quality_summary.get("overall_quality", "not_available"),
+
+        # Second TIFF copy inside the shared /tiff folder
+        "tiff_collection_copy": str(shared_tiff_path),
+
+        "quality_report": quality_report.get(
+            "txt",
+            "",
+        ),
+
+        "quality": quality_summary.get(
+            "overall_quality",
+            "not_available",
+        ),
+
         "alignment": export_result["alignment"],
+
         "history_retry_used": bool(
-            export_result["alignment"].get("history_retry_used", False)
+            export_result["alignment"].get(
+                "history_retry_used",
+                False,
+            )
         ),
     }
 
