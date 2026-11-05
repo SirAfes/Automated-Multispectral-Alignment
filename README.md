@@ -85,6 +85,17 @@ DSC06664/
 └── DSC06664_aligned_multiband_alignment_quality.csv
 ```
 
+## Supported input formats
+
+| Type | Extensions | Split lens images | Final TIFF |
+|---|---|---|---|
+| Standard | `.jpg`, `.jpeg`, `.png`, `.tif`, `.tiff` | `1.jpg … 6.jpg` | 8-bit |
+| Camera RAW | `.arw`, `.raw` (also `.dng`, `.nef`, `.cr2`, `.cr3`, `.orf`, `.rw2`, `.raf`, `.pef`, `.srw`) | `1.tif … 6.tif` (16-bit, lossless) | 16-bit |
+
+RAW files are decoded with [rawpy](https://github.com/letmaik/rawpy) (LibRaw) as close to the sensor data as possible: no white balance, no camera colour matrix, linear response and no automatic brightening. Each sensor channel therefore stays a separate spectral measurement, and the same band mapping is used as for JPG input.
+
+RAW outputs get the RAW extension in their name, so a RAW+JPG pair of the same shot does not overwrite each other — for example `DSC06664.ARW` produces `DSC06664_ARW/` and `DSC06664_ARW_aligned_multiband.tif`.
+
 The final TIFF contains 14 bands in wavelength order:
 
 `405, 430, 450, 490, 525, 550, 560, 570, 630, 650, 685, 710, 735, 850 nm`

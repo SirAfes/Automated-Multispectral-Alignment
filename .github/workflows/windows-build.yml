@@ -34,6 +34,11 @@ jobs:
         run: |
           python -c "import cv2,sys; print(cv2.__version__); print('AKAZE:',hasattr(cv2,'AKAZE_create')); sys.exit(0 if hasattr(cv2,'AKAZE_create') else 1)"
 
+      - name: Verify RAW (rawpy/LibRaw) support
+        shell: pwsh
+        run: |
+          python -c "import rawpy; print('rawpy', rawpy.__version__, 'LibRaw', rawpy.libraw_version)"
+
       - name: Build executable
         shell: pwsh
         run: |
