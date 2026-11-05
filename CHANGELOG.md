@@ -1,6 +1,23 @@
 # Changelog
 
-## Unreleased
+## 1.0.0 — first public release
+
+### Added
+
+- Closure check: every shift of a finished alignment is tested independently on the image (bounded local NCC) - adjacent pairs not measured directly and the measured pairs themselves. `closure_check`: reject (default), warn or off. Results in the quality report, CSV and run summary.
+- Any rectangular lens array (`grid_cols` x `grid_rows`): fallback chain, search windows, history and closure pairs are derived from the grid instead of being written for the 3 x 2 camera.
+- Fallback search windows follow the lens baseline direction with a configurable `parallax_range_px`; the previous fixed windows started at 80 px and could miss shifts at longer working distances.
+- Command line interface `msalign` (files and folders, `--config`, `--set`, `--batch` / `--no-batch`, `--list-settings`).
+- Installable Python package (`pip install`), with `msalign` and `msalign-gui` commands.
+- Run log and per-image summary CSV in `msalign_runs/`.
+- CONTRIBUTING.md, CITATION.cff.
+
+### Changed
+
+- Source reorganised into the `msalign` package (`src/msalign/`); diagnostics use `logging` instead of `print`.
+- Alignment modes are named `primary_direct_<ref>_reference` and `fallback_chain_<ref>_reference`.
+
+## Earlier changes (pre-1.0)
 
 ### Added
 

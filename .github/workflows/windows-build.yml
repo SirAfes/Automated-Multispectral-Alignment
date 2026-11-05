@@ -8,6 +8,7 @@ on:
       - 'src/**'
       - 'requirements*.txt'
       - 'build/**'
+      - 'pyproject.toml'
       - '.github/workflows/windows-build.yml'
 
 jobs:

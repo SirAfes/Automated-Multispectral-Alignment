@@ -1,22 +1,25 @@
 """
-pipeline_core.py
+pipeline.py
 
-Batch processing logic without any GUI code, so it can be tested and reused.
+Processing of one image and of a whole selection, without any GUI code.
 
-The GUI calls run_pipeline() in a background thread and receives progress as
-event tuples through `emit`.
+The GUI and the command line call run_pipeline(); progress is reported as event
+tuples through `emit` (see _Run for the list).
 """
 
 from __future__ import annotations
 
+import csv
+import logging
 import os
 import re
 import shutil
 import time
 import traceback
+from datetime import datetime
 from pathlib import Path
 
-from batch_core import (
+from .batch import (
     calibration_indices,
     check_verification,
     compute_consensus,
@@ -24,7 +27,8 @@ from batch_core import (
     response_thresholds,
     verify_shifts,
 )
-from image_io import (
+from .closure import closure_failed, describe_failures
+from .image_io import (
     STANDARD_EXTENSIONS,
     SUPPORTED_EXTENSIONS,
     find_split_set,
@@ -32,14 +36,22 @@ from image_io import (
     read_image,
     split_ext_for_input,
 )
-from settings import file_bands_int, load_settings
-from split_core import save_split_cells, split_compound_array
-from stack_core import (
+from .layout import layout_from_settings
+from .matching import PreparedImages
+from .settings import file_bands_int, load_settings
+from .split import save_split_cells, split_compound_array
+from .stack import (
     build_alignment_priors,
     export_aligned_tiff,
     export_multipage_tiff_from_split,
     load_split_images,
+    run_closure_check,
 )
+
+
+log = logging.getLogger(__name__)
+
+RUN_DIR_NAME = "msalign_runs"
 
 
 # ---------------------------------------------------------------------------
@@ -77,6 +89,17 @@ def collect_folder_images(folder, prefer_raw: bool = True) -> list[Path]:
         ]
 
     return sort_paths(files)
+
+
+def expand_inputs(paths) -> list[Path]:
+    """Files are kept, folders are expanded with collect_folder_images; result is sorted."""
+    out = []
+    for p in map(Path, paths):
+        if p.is_dir():
+            out.extend(collect_folder_images(p))
+        else:
+            out.append(p)
+    return sort_paths(dict.fromkeys(out))
 
 
 # ---------------------------------------------------------------------------
@@ -165,14 +188,12 @@ def _finish(input_path, paths, export_result, settings, status_callback):
     )
 
     quality_report = export_result.get("quality_report", {})
-    quality_summary = quality_report.get("summary", {})
+    summary = quality_report.get("summary", {})
+    alignment = export_result["alignment"]
 
-    print("TIFF export completed.")
-    print(f"Primary TIFF: {paths['tiff']}")
+    log.info("TIFF written: %s", paths["tiff"])
     if collection_error:
-        print(f"WARNING: shared TIFF copy failed: {collection_error}")
-    elif collection_path:
-        print(f"Shared TIFF: {collection_path}")
+        log.warning("Shared TIFF copy failed: %s", collection_error)
 
     return {
         "input": str(input_path),
@@ -182,11 +203,13 @@ def _finish(input_path, paths, export_result, settings, status_callback):
         "tiff_collection_copy_ok": collection_error is None,
         "tiff_collection_copy_error": collection_error or "",
         "quality_report": quality_report.get("txt", ""),
-        "quality": quality_summary.get("overall_quality", "not_available"),
-        "alignment": export_result["alignment"],
+        "quality": summary.get("overall_quality", "not_available"),
+        "closure_status": summary.get("closure_status", "not_checked"),
+        "closure_max_residual": summary.get("closure_max_residual"),
+        "alignment": alignment,
         "split_info": export_result.get("split_info", {}),
-        "history_retry_used": bool(export_result["alignment"].get("history_retry_used", False)),
-        "batch_consensus_used": export_result["alignment"].get("mode") == "batch_consensus",
+        "history_retry_used": bool(alignment.get("history_retry_used", False)),
+        "batch_consensus_used": alignment.get("mode") == "batch_consensus",
     }
 
 
@@ -197,30 +220,28 @@ def process_single_file(
     status_callback=None,
     settings=None,
 ):
-    """Full per-image processing: split, search alignment, export, report."""
+    """Full per-image processing: split, search alignment, check, export, report."""
     settings = settings or load_settings()
+    layout = layout_from_settings(settings)
     input_path = Path(input_path)
     paths = output_paths(input_path)
     split_ext = split_ext_for_input(input_path)
 
-    print(f"\n=== Processing: {input_path.name} ===")
-    print(f"Output folder: {paths['base']}")
+    log.info("=== Processing: %s ===", input_path.name)
 
     images = None
     split_info = {}
-    if reuse_split and find_split_set(paths["split_dir"], split_ext):
+    if reuse_split and find_split_set(paths["split_dir"], split_ext, layout.count):
         if status_callback:
-            status_callback("Using existing six lens images")
-        print("Using existing split lens images.")
+            status_callback("Using existing lens images")
     else:
         if status_callback:
-            status_callback("Splitting compound image into six lens images")
+            status_callback(f"Splitting compound image into {layout.count} lens images")
         images, split_info = split_compound_array(read_image(input_path), **_split_kwargs(settings))
         save_split_cells(images, paths["split_dir"], split_ext, settings["jpeg_quality"])
-        print("Split completed.")
 
     if images is None:
-        images = load_split_images(paths["split_dir"], split_ext)
+        images = load_split_images(paths["split_dir"], split_ext, layout.count)
 
     export_result = export_multipage_tiff_from_split(
         split_dir=paths["split_dir"],
@@ -231,6 +252,7 @@ def process_single_file(
         file_bands=file_bands_int(settings),
         output_order=settings["output_order"],
         split_info=split_info,
+        settings=settings,
     )
     return _finish(input_path, paths, export_result, settings, status_callback)
 
@@ -248,29 +270,41 @@ def process_with_consensus(
 ):
     """
     Fast path for batch mode: split in memory, verify the consensus shift on
-    this image and export with it. Raises ConsensusRejected if not confirmed.
+    this image (plus the closure check) and export with it.
+    Raises ConsensusRejected if not confirmed.
     """
     settings = settings or load_settings()
+    layout = layout_from_settings(settings)
     input_path = Path(input_path)
     paths = output_paths(input_path)
 
-    print(f"\n=== Processing (batch consensus): {input_path.name} ===")
+    log.info("=== Processing (batch consensus): %s ===", input_path.name)
 
     if status_callback:
-        status_callback("Splitting compound image into six lens images")
+        status_callback(f"Splitting compound image into {layout.count} lens images")
     images, split_info = split_compound_array(read_image(input_path), **_split_kwargs(settings))
 
     if status_callback:
         status_callback("Verifying batch lens geometry on this image")
+    prepared = PreparedImages(images)
     try:
         verification = verify_shifts(
-            images, consensus["shifts"], settings["batch_verify_max_residual_px"]
+            images,
+            consensus["shifts"],
+            settings["batch_verify_max_residual_px"],
+            reference=consensus["reference"],
+            prepared=prepared,
         )
     except ValueError as exc:
         raise ConsensusRejected(str(exc)) from exc
     ok, reason = check_verification(verification, thresholds, settings)
     if not ok:
         raise ConsensusRejected(reason)
+
+    alignment = consensus_alignment_result(consensus, verification)
+    rows = run_closure_check(images, alignment, layout, settings, prepared)
+    if settings["closure_check"] == "reject" and closure_failed(rows):
+        raise ConsensusRejected(describe_failures(rows))
 
     if settings["batch_keep_split_images"]:
         save_split_cells(
@@ -279,7 +313,7 @@ def process_with_consensus(
 
     export_result = export_aligned_tiff(
         images,
-        consensus_alignment_result(consensus, verification),
+        alignment,
         paths["tiff"],
         status_callback=status_callback,
         file_bands=file_bands_int(settings),
@@ -287,6 +321,52 @@ def process_with_consensus(
         split_info=split_info,
     )
     return _finish(input_path, paths, export_result, settings, status_callback)
+
+
+# ---------------------------------------------------------------------------
+# Run files: log + summary CSV
+# ---------------------------------------------------------------------------
+
+SUMMARY_FIELDS = [
+    "index", "file", "status", "mode", "quality", "closure", "closure_max_residual_px",
+    "batch_consensus", "history_retry", "second_pass", "seconds", "tiff", "error",
+]
+
+
+class RunFiles:
+    """
+    <first input folder>/msalign_runs/<timestamp>.log and <timestamp>_summary.csv.
+    The summary is written row by row, so it is useful even if a run is stopped.
+    """
+
+    def __init__(self, folder: Path, verbose: bool = False):
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.dir = Path(folder) / RUN_DIR_NAME
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.log_path = self.dir / f"{stamp}.log"
+        self.summary_path = self.dir / f"{stamp}_summary.csv"
+
+        self.handler = logging.FileHandler(self.log_path, encoding="utf-8")
+        self.handler.setLevel(logging.DEBUG if verbose else logging.INFO)
+        self.handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        root = logging.getLogger("msalign")
+        root.addHandler(self.handler)
+        if root.level == logging.NOTSET or root.level > self.handler.level:
+            root.setLevel(self.handler.level)
+
+        self._file = self.summary_path.open("w", newline="", encoding="utf-8")
+        self._writer = csv.DictWriter(self._file, fieldnames=SUMMARY_FIELDS)
+        self._writer.writeheader()
+        self._file.flush()
+
+    def row(self, **values):
+        self._writer.writerow({k: values.get(k, "") for k in SUMMARY_FIELDS})
+        self._file.flush()
+
+    def close(self):
+        self._file.close()
+        logging.getLogger("msalign").removeHandler(self.handler)
+        self.handler.close()
 
 
 # ---------------------------------------------------------------------------
@@ -301,7 +381,7 @@ def nearest_success_alignments(success_records, index, limit):
 
 class _Run:
     """
-    Shared state of one batch run.
+    Shared state of one run.
 
     Events emitted (tuples):
         ("mode", text)                         processing mode chosen
@@ -314,22 +394,58 @@ class _Run:
         ("attempt_complete", elapsed)
         ("retry_begin", count)
         ("done" | "cancelled", success_records, failed_indices)
+        ("run_files", log_path, summary_path)   emitted by run_pipeline
     """
 
-    def __init__(self, file_paths, emit, stop_event, settings):
+    def __init__(self, file_paths, emit, stop_event, settings, run_files=None):
         self.paths = [Path(p) for p in file_paths]
-        self.emit = emit
+        self._emit = emit
         self.stop_event = stop_event
         self.settings = settings
+        self.layout = layout_from_settings(settings)
+        self.run_files = run_files
         self.success = {}
+        self.errored = set()
         self.pending_retry = []
         self.history = int(settings["history_length"])
+
+    # --- events + summary ---------------------------------------------------
+
+    def emit(self, event):
+        if self.run_files is not None:
+            kind = event[0]
+            if kind == "success":
+                _, index, result, elapsed, recovered = event
+                self.run_files.row(
+                    index=index + 1, file=self.paths[index].name, status="success",
+                    mode=result["alignment"].get("mode", ""), quality=result.get("quality", ""),
+                    closure=result.get("closure_status", ""),
+                    closure_max_residual_px=result.get("closure_max_residual") or "",
+                    batch_consensus=result.get("batch_consensus_used", False),
+                    history_retry=result.get("history_retry_used", False),
+                    second_pass=recovered, seconds=round(elapsed, 1), tiff=result.get("tiff", ""),
+                )
+            elif kind == "final_error":
+                _, index, error, elapsed = event
+                self.errored.add(index)
+                self.run_files.row(
+                    index=index + 1, file=self.paths[index].name, status="error",
+                    seconds=round(elapsed, 1), error=error,
+                )
+        self._emit(event)
 
     def stopped(self):
         return self.stop_event is not None and self.stop_event.is_set()
 
     def _status(self, index, phase):
         return lambda stage: self.emit(("stage", index, stage, phase))
+
+    def priors(self, alignments, max_samples=None):
+        return build_alignment_priors(
+            alignments, max_samples=max_samples or self.history, layout=self.layout
+        )
+
+    # --- steps --------------------------------------------------------------
 
     def standard(self, index, priors, phase="initial"):
         """Full alignment for one image; failures go to the retry queue."""
@@ -348,27 +464,44 @@ class _Run:
             self.emit(("success", index, result, elapsed, False))
         except Exception as exc:
             elapsed = time.perf_counter() - started
+            log.info("%s: first pass failed: %s", path.name, exc)
+            log.debug(traceback.format_exc())
             self.pending_retry.append({
                 "index": index,
                 "path": path,
                 "first_error": short_error(exc),
-                "traceback": traceback.format_exc(),
             })
             self.emit(("retry_queued", index, short_error(exc), elapsed))
         self.emit(("attempt_complete", elapsed))
 
     def previous_priors(self, index):
         previous = sorted(i for i in self.success if i < index)[-self.history:]
-        return build_alignment_priors(
-            [self.success[i]["alignment"] for i in previous],
-            max_samples=self.history,
-        )
+        return self.priors([self.success[i]["alignment"] for i in previous])
 
     def run_standard(self, indices):
         for index in indices:
             if self.stopped():
                 return
             self.standard(index, self.previous_priors(index))
+
+    def _calibration_thresholds(self, agreeing, consensus):
+        """Verification correlation on calibration images at their own known-good shifts."""
+        s = self.settings
+        ref = consensus["reference"]
+        verifications = []
+        for i in agreeing:
+            src = self.paths[i]
+            try:
+                images = load_split_images(
+                    output_paths(src)["split_dir"], split_ext_for_input(src), self.layout.count
+                )
+                own = self.success[i]["alignment"]["apply_shifts"]
+                verifications.append(
+                    verify_shifts(images, own, s["batch_verify_max_residual_px"], reference=ref)
+                )
+            except (OSError, ValueError) as exc:
+                log.debug("calibration image %s skipped for thresholds: %s", src.name, exc)
+        return response_thresholds(verifications, s)
 
     def run_batch(self):
         s = self.settings
@@ -382,44 +515,26 @@ class _Run:
             self.standard(index, self.previous_priors(index), phase="calibration")
 
         calib_ok = [i for i in calib if i in self.success]
-        consensus = compute_consensus([self.success[i]["alignment"] for i in calib_ok], s)
-        rest = [i for i in range(total) if i not in set(calib)]
+        consensus = compute_consensus(
+            [self.success[i]["alignment"] for i in calib_ok], s,
+            reference=self.layout.primary_reference,
+        )
+        calib_set = set(calib)
+        rest = [i for i in range(total) if i not in calib_set]
 
         if not consensus["consistent"]:
+            log.info("No batch consensus: %s", consensus["reason"])
             self.emit(("phase", f"No common geometry ({consensus['reason']}); aligning each image"))
             self.run_standard(rest)
             return
 
-        # Data-driven verification thresholds from calibration images with known-good shifts.
         agreeing = [i for i, ok in zip(calib_ok, consensus["agreeing_mask"]) if ok]
-        verifications = []
-        for i in agreeing:
-            src = self.paths[i]
-            try:
-                images = load_split_images(output_paths(src)["split_dir"], split_ext_for_input(src))
-            except Exception:
-                continue
-            own = {
-                k: {
-                    "dx": self.success[i]["alignment"]["apply_shifts"][k]["dx"]
-                    - self.success[i]["alignment"]["apply_shifts"][1]["dx"],
-                    "dy": self.success[i]["alignment"]["apply_shifts"][k]["dy"]
-                    - self.success[i]["alignment"]["apply_shifts"][1]["dy"],
-                }
-                for k in range(1, 7)
-            }
-            try:
-                verifications.append(verify_shifts(images, own, s["batch_verify_max_residual_px"]))
-            except ValueError:
-                continue
-        thresholds = response_thresholds(verifications, s)
-        priors = build_alignment_priors(
-            [self.success[i]["alignment"] for i in agreeing], max_samples=len(agreeing)
-        )
+        thresholds = self._calibration_thresholds(agreeing, consensus)
+        priors = self.priors([self.success[i]["alignment"] for i in agreeing], len(agreeing))
 
+        log.info("Batch consensus: %s; shifts %s", consensus["reason"], consensus["shifts"])
+        log.info("Verification correlation thresholds: %s", thresholds)
         self.emit(("phase", f"Applying batch geometry ({consensus['reason']})"))
-        print(f"Batch consensus shifts: {consensus['shifts']}")
-        print(f"Verification response thresholds: {thresholds}")
 
         for index in rest:
             if self.stopped():
@@ -429,9 +544,7 @@ class _Run:
             started = time.perf_counter()
             try:
                 result = process_with_consensus(
-                    path,
-                    consensus,
-                    thresholds,
+                    path, consensus, thresholds,
                     status_callback=self._status(index, "consensus"),
                     settings=s,
                 )
@@ -440,16 +553,17 @@ class _Run:
                 self.emit(("success", index, result, elapsed, False))
                 self.emit(("attempt_complete", elapsed))
             except ConsensusRejected as exc:
-                print(f"{path.name}: {exc} -> full alignment")
+                log.info("%s: %s -> full alignment", path.name, exc)
                 self.emit(("stage", index, "Geometry differs - running full alignment", "consensus"))
                 self.standard(index, priors, phase="initial")
             except Exception as exc:
                 elapsed = time.perf_counter() - started
+                log.info("%s: failed: %s", path.name, exc)
+                log.debug(traceback.format_exc())
                 self.pending_retry.append({
                     "index": index,
                     "path": path,
                     "first_error": short_error(exc),
-                    "traceback": traceback.format_exc(),
                 })
                 self.emit(("retry_queued", index, short_error(exc), elapsed))
                 self.emit(("attempt_complete", elapsed))
@@ -463,15 +577,13 @@ class _Run:
             if self.stopped():
                 return
             index = item["index"]
-            priors = build_alignment_priors(
-                nearest_success_alignments(self.success, index, self.history),
-                max_samples=self.history,
-            )
+            priors = self.priors(nearest_success_alignments(self.success, index, self.history))
             if not priors:
                 self.emit((
                     "final_error",
                     index,
-                    "No successful neighbouring alignment was available for a history-guided retry.",
+                    f"First pass: {item['first_error']} | no successful neighbouring image "
+                    "for a history-guided retry",
                     0.0,
                 ))
                 continue
@@ -504,21 +616,44 @@ def use_batch_mode(count: int, settings: dict) -> bool:
     return count >= int(settings["batch_threshold"])
 
 
-def run_pipeline(file_paths, emit, stop_event=None, settings=None):
-    """Process all files (in the given order). Returns (success_records, failed_indices)."""
+def run_pipeline(file_paths, emit=None, stop_event=None, settings=None,
+                 run_files: bool = True, verbose: bool = False):
+    """
+    Process all files in the given order. Returns (success_records, failed_indices).
+
+    With run_files=True, a log and a summary CSV are written to
+    <first input folder>/msalign_runs/.
+    """
     settings = settings or load_settings()
-    run = _Run(file_paths, emit, stop_event, settings)
-    total = len(run.paths)
+    emit = emit or (lambda event: None)
+    paths = [Path(p) for p in file_paths]
 
-    if use_batch_mode(total, settings):
-        emit(("mode", "Batch consensus mode"))
-        run.run_batch()
-    else:
-        emit(("mode", "Per-image alignment"))
-        run.run_standard(range(total))
+    files = RunFiles(paths[0].parent, verbose) if (run_files and paths) else None
+    run = _Run(paths, emit, stop_event, settings, files)
+    total = len(paths)
 
-    run.run_retry()
+    try:
+        if files is not None:
+            emit(("run_files", str(files.log_path), str(files.summary_path)))
+        log.info("msalign run: %d image(s), settings from %s", total, settings.get("_source", "?"))
+        if use_batch_mode(total, settings):
+            emit(("mode", "Batch consensus mode"))
+            run.run_batch()
+        else:
+            emit(("mode", "Per-image alignment"))
+            run.run_standard(range(total))
 
-    failed = [i for i in range(total) if i not in run.success]
+        run.run_retry()
+
+        failed = [i for i in range(total) if i not in run.success]
+        if files is not None and run.stopped():
+            for i in failed:
+                if i not in run.errored:
+                    files.row(index=i + 1, file=paths[i].name, status="not processed")
+        log.info("Finished: %d successful, %d failed", len(run.success), len(failed))
+    finally:
+        if files is not None:
+            files.close()
+
     emit(("cancelled" if run.stopped() else "done", run.success, failed))
     return run.success, failed

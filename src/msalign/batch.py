@@ -1,5 +1,5 @@
 """
-batch_core.py
+batch.py
 
 Batch consensus mode for large sets of images taken with the same camera at the
 same distance.
@@ -21,13 +21,9 @@ Idea:
 
 from __future__ import annotations
 
-import cv2
 import numpy as np
 
-from alignment_core import gradient_mag, to_gray_float
-
-
-LENSES = range(1, 7)
+from .matching import PreparedImages, match_at
 
 
 def calibration_indices(total: int, samples: int) -> list[int]:
@@ -37,16 +33,17 @@ def calibration_indices(total: int, samples: int) -> list[int]:
     return sorted({int(round(i * (total - 1) / (samples - 1))) for i in range(samples)})
 
 
-def _relative_shifts(alignment) -> dict[int, tuple[int, int]]:
-    """Apply shifts expressed relative to lens 1 (both primary and Plan B results)."""
+def _relative_shifts(alignment, reference) -> dict[int, tuple[int, int]]:
+    """Apply shifts relative to the reference lens (comparable across alignment modes)."""
     s = alignment["apply_shifts"]
+    r = s[reference]
     return {
-        k: (int(s[k]["dx"]) - int(s[1]["dx"]), int(s[k]["dy"]) - int(s[1]["dy"]))
-        for k in LENSES
+        k: (int(v["dx"]) - int(r["dx"]), int(v["dy"]) - int(r["dy"]))
+        for k, v in s.items()
     }
 
 
-def compute_consensus(alignments, settings) -> dict:
+def compute_consensus(alignments, settings, reference: int = 1) -> dict:
     """
     Robust per-lens consensus from successful calibration alignments.
 
@@ -56,8 +53,9 @@ def compute_consensus(alignments, settings) -> dict:
         successful, agreeing, agreeing_mask, tolerance_px, spread_px, reason
     """
     tol = float(settings["batch_consensus_tolerance_px"])
-    rel = [_relative_shifts(a) for a in alignments]
+    rel = [_relative_shifts(a, reference) for a in alignments]
     n = len(rel)
+    lenses = sorted(rel[0]) if rel else []
 
     result = {
         "consistent": False,
@@ -68,6 +66,7 @@ def compute_consensus(alignments, settings) -> dict:
         "tolerance_px": tol,
         "spread_px": {},
         "reason": "",
+        "reference": reference,
     }
 
     if n < int(settings["batch_min_successful_samples"]):
@@ -83,12 +82,12 @@ def compute_consensus(alignments, settings) -> dict:
                 float(np.median([r[k][0] for r in rows])),
                 float(np.median([r[k][1] for r in rows])),
             )
-            for k in LENSES
+            for k in lenses
         }
 
     med = medians(rel)
     mask = [
-        all(abs(r[k][0] - med[k][0]) <= tol and abs(r[k][1] - med[k][1]) <= tol for k in LENSES)
+        all(abs(r[k][0] - med[k][0]) <= tol and abs(r[k][1] - med[k][1]) <= tol for k in lenses)
         for r in rel
     ]
     agreeing = [r for r, ok in zip(rel, mask) if ok]
@@ -103,10 +102,10 @@ def compute_consensus(alignments, settings) -> dict:
         return result
 
     med = medians(agreeing)
-    result["shifts"] = {k: {"dx": int(round(med[k][0])), "dy": int(round(med[k][1]))} for k in LENSES}
+    result["shifts"] = {k: {"dx": int(round(med[k][0])), "dy": int(round(med[k][1]))} for k in lenses}
     result["spread_px"] = {
         k: float(max(np.hypot(r[k][0] - med[k][0], r[k][1] - med[k][1]) for r in agreeing))
-        for k in LENSES
+        for k in lenses
     }
 
     agreement = len(agreeing) / n
@@ -126,84 +125,23 @@ def compute_consensus(alignments, settings) -> dict:
 # Per-image verification
 # ---------------------------------------------------------------------------
 
-VERIFY_DOWNSCALE = 2
-# Extra search radius beyond the accepted residual (full-resolution px), so a
-# peak at the edge of the search window (= true shift outside it) can be
-# recognised and rejected.
-VERIFY_SEARCH_MARGIN_PX = 4
-
-
-def _prep_for_verify(img):
-    h, w = img.shape[:2]
-    small = cv2.resize(
-        img,
-        (w // VERIFY_DOWNSCALE, h // VERIFY_DOWNSCALE),
-        interpolation=cv2.INTER_AREA,
-    )
-    return gradient_mag(to_gray_float(small))
-
-
-def _subpixel(values, i):
-    """Parabolic peak refinement along one axis."""
-    if 0 < i < len(values) - 1:
-        a, b, c = values[i - 1], values[i], values[i + 1]
-        denom = a - 2 * b + c
-        if abs(denom) > 1e-9:
-            return i + 0.5 * (a - c) / denom
-    return float(i)
-
-
-def verify_shifts(images, shifts, max_residual_px: float = 5.0) -> dict[int, dict]:
+def verify_shifts(images, shifts, max_residual_px: float = 5.0, reference: int = 1,
+                  prepared: PreparedImages | None = None) -> dict[int, dict]:
     """
-    Check given shifts (relative to lens 1) on one image set.
-
-    For each lens, the centre of lens 1 (gradient image) is searched for in the
-    lens image within a small window around the expected position (normalised
-    cross-correlation). A correct shift gives a peak at the expected position,
-    i.e. a residual near 0 px. Searching only locally avoids picking up a
-    strong but unrelated match elsewhere in the image.
+    Check given shifts (apply shifts relative to `reference`) on one image set
+    with a bounded local match per lens (see matching.py).
 
     Returns {lens: {"residual_dx", "residual_dy", "residual", "response",
-    "at_edge"}} for lens 2..6 (residuals in full-resolution pixels).
+    "at_edge"}} for every lens except the reference (full-resolution px).
     """
-    s = VERIFY_DOWNSCALE
-    r = int(np.ceil((max_residual_px + VERIFY_SEARCH_MARGIN_PX) / s))
-    ref = _prep_for_verify(images[1])
-    h, w = ref.shape
-
-    max_shift = max(max(abs(v["dx"]), abs(v["dy"])) for v in shifts.values()) / s
-    margin = int(np.ceil(max_shift)) + r + int(0.12 * min(h, w))
-    if 2 * margin >= min(h, w) - 32:
-        raise ValueError("shifts too large for verification")
-    template = np.ascontiguousarray(ref[margin:h - margin, margin:w - margin])
-
+    prepared = prepared or PreparedImages(images)
     out = {}
-    for k in LENSES:
-        if k == 1:
+    for k in images:
+        if k == reference:
             continue
-        mov = _prep_for_verify(images[k])
-        # Lens k pixel (x, y) shows what lens 1 shows at (x + dx, y + dy);
-        # the template therefore sits at (margin - dx, margin - dy) in lens k.
-        ex = margin - shifts[k]["dx"] / s
-        ey = margin - shifts[k]["dy"] / s
-        x0, y0 = int(round(ex)) - r, int(round(ey)) - r
-        region = mov[y0:y0 + template.shape[0] + 2 * r, x0:x0 + template.shape[1] + 2 * r]
-        scores = cv2.matchTemplate(region, template, cv2.TM_CCOEFF_NORMED)
-
-        _, peak, _, (px, py) = cv2.minMaxLoc(scores)
-        sx = _subpixel(scores[py, :], px)
-        sy = _subpixel(scores[:, px], py)
-        found_x, found_y = x0 + sx, y0 + sy
-        # residual = correction that would have to be added to the apply shift
-        rx = (ex - found_x) * s
-        ry = (ey - found_y) * s
-        out[k] = {
-            "residual_dx": float(rx),
-            "residual_dy": float(ry),
-            "residual": float(np.hypot(rx, ry)),
-            "response": float(peak),
-            "at_edge": bool(px in (0, 2 * r) or py in (0, 2 * r)),
-        }
+        rel_dx = shifts[k]["dx"] - shifts[reference]["dx"]
+        rel_dy = shifts[k]["dy"] - shifts[reference]["dy"]
+        out[k] = match_at(prepared, reference, k, rel_dx, rel_dy, max_residual_px)
     return out
 
 
@@ -214,9 +152,8 @@ def response_thresholds(verifications, settings) -> dict[int, float]:
     """
     ratio = float(settings["batch_verify_min_response_ratio"])
     thresholds = {}
-    for k in LENSES:
-        if k == 1:
-            continue
+    lenses = sorted({k for v in verifications for k in v})
+    for k in lenses:
         values = [v[k]["response"] for v in verifications if k in v]
         thresholds[k] = ratio * float(np.median(values)) if values else 0.0
     return thresholds
@@ -244,22 +181,17 @@ def consensus_alignment_result(consensus, verification) -> dict:
     """
     # The verified residual is measured precisely, so it is added as a small
     # per-image refinement: consensus = anchor, residual = local correction.
-    shifts = {1: {"dx": 0, "dy": 0}}
-    for k in LENSES:
-        if k == 1:
-            continue
-        v = verification[k]
+    ref = consensus["reference"]
+    shifts = {ref: {"dx": 0, "dy": 0}}
+    for k, v in verification.items():
         shifts[k] = {
             "dx": consensus["shifts"][k]["dx"] + int(round(v["residual_dx"])),
             "dy": consensus["shifts"][k]["dy"] + int(round(v["residual_dy"])),
         }
 
     pairs = {}
-    for k in LENSES:
-        if k == 1:
-            continue
-        v = verification[k]
-        pairs[f"1-{k}"] = {
+    for k, v in verification.items():
+        pairs[f"{ref}-{k}"] = {
             "raw_dx": -shifts[k]["dx"],
             "raw_dy": -shifts[k]["dy"],
             "apply_dx": shifts[k]["dx"],
@@ -282,10 +214,10 @@ def consensus_alignment_result(consensus, verification) -> dict:
         }
 
     return {
-        "reference_id": 1,
+        "reference_id": ref,
         "mode": "batch_consensus",
         "pairs": pairs,
-        "raw_shifts": {},
+        "measured_edges": [(ref, k) for k in verification],
         "apply_shifts": shifts,
         "history_priors_available": 0,
         "history_retry_used": False,

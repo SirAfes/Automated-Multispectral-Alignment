@@ -9,7 +9,7 @@ hiddenimports = (
 )
 
 a = Analysis(
-    ['../src/run_pipeline_gui.py'],
+    ['launch_gui.py'],
     pathex=['../src'],
     binaries=collect_dynamic_libs('rawpy'),
     datas=[],

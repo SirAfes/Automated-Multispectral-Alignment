@@ -1,0 +1,16 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "Automated Multispectral Alignment (msalign)"
+abstract: "Automated registration of multi-lens (snapshot) multispectral images into aligned multiband TIFFs, with multi-stage estimation, an independent closure check and a batch consensus mode for large series."
+type: software
+authors:
+  - family-names: Semerci
+    given-names: Ahmet F.
+version: 1.0.0
+license: MIT
+repository-code: "https://github.com/SirAfes/Automated-Multispectral-Alignment"
+keywords:
+  - multispectral imaging
+  - image registration
+  - snapshot multispectral camera
+  - camera RAW

@@ -1,4 +1,10 @@
-"""Windows-style desktop interface for the multispectral alignment pipeline."""
+"""
+gui.py
+
+Desktop interface: choose images or a folder, then a progress window in the
+style of the Windows file-copy dialog. Processing runs in a background thread
+(pipeline.run_pipeline); this module only displays its events.
+"""
 
 from __future__ import annotations
 
@@ -12,9 +18,9 @@ import traceback
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from image_io import file_dialog_types
-from pipeline_core import collect_folder_images, run_pipeline, sort_paths, use_batch_mode
-from settings import load_settings
+from .image_io import file_dialog_types
+from .pipeline import collect_folder_images, run_pipeline, sort_paths, use_batch_mode
+from .settings import load_settings
 
 
 RATE_HISTORY_LENGTH = 72
@@ -81,6 +87,7 @@ class PipelineWindow:
         self.rate_history = deque([0.0] * RATE_HISTORY_LENGTH, maxlen=RATE_HISTORY_LENGTH)
         self.last_rate = 0.0
         self.tree_items = {}
+        self.summary_path = None
 
         self._configure_style()
         self._build_ui()
@@ -438,6 +445,13 @@ class PipelineWindow:
                 )
                 status_text = "Success / warning"
 
+            closure = result.get("closure_status")
+            if closure == "fail":
+                note_parts.insert(1, "Closure check FAILED - inspect")
+                status_text = "Success / check"
+            elif closure == "pass":
+                note_parts.insert(1, "Closure check passed")
+
             self._set_tree(index, status=status_text, details=" · ".join(note_parts))
             self.success_count += 1
             if recovered and self.retry_pending_count > 0:
@@ -469,6 +483,10 @@ class PipelineWindow:
         elif kind == "attempt_complete":
             _, elapsed = event
             self._record_attempt_duration(float(elapsed))
+
+        elif kind == "run_files":
+            _, _log_path, summary_path = event
+            self.summary_path = summary_path
 
         elif kind in {"mode", "phase"}:
             _, text = event
@@ -502,9 +520,10 @@ class PipelineWindow:
                         self._set_tree(index, status="Cancelled", details="Not processed")
             else:
                 self.name_label.configure(text="Processing complete")
-                self.stage_label.configure(
-                    text=f"{len(success_records)} successful · {len(failed_indices)} error(s)"
-                )
+                summary = f"{len(success_records)} successful · {len(failed_indices)} error(s)"
+                if self.summary_path:
+                    summary += f"\nSummary: {self.summary_path}"
+                self.stage_label.configure(text=summary)
                 self.success_count = len(success_records)
                 self.error_count = len(failed_indices)
                 self.retry_pending_count = 0

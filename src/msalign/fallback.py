@@ -1,5 +1,5 @@
 """
-alignment_plan_b.py
+fallback.py
 
 Fallback alignment utilities for difficult multispectral image pairs.
 
@@ -11,11 +11,13 @@ Implemented stages:
 Historical geometry is used only after the normal pair estimators reject a result.
 """
 
+import logging
+
 import cv2
 import numpy as np
 
-from image_io import to_uint8
-from alignment_core import (
+from .image_io import to_uint8
+from .alignment import (
     DEFAULT_CONFIG,
     estimate_xy_v4,
     to_gray_float,
@@ -69,26 +71,6 @@ DEFAULT_PLAN_B_CONFIG = {
 
 
 # =========================================================
-# PAIR GEOMETRY PRIORS
-# =========================================================
-PAIR_PRIORS = {
-    (1, 2): {"dx_min": 80,  "dx_max": 300, "dy_min": -20, "dy_max": 80},
-    (1, 3): {"dx_min": 160, "dx_max": 320, "dy_min": -20, "dy_max": 100},
-    (1, 4): {"dx_min": -100, "dx_max": 60, "dy_min": 80,  "dy_max": 300},
-    (1, 5): {"dx_min": 40,  "dx_max": 300, "dy_min": 100, "dy_max": 320},
-    (1, 6): {"dx_min": 160, "dx_max": 320, "dy_min": 120, "dy_max": 320},
-
-
-    # Optional 2/5-centered pairs for manual testing
-    (2, 1): {"dx_min": -320, "dx_max": -80, "dy_min": -80, "dy_max": 20},
-    (2, 3): {"dx_min": 80,   "dx_max": 320, "dy_min": -20, "dy_max": 80},
-    (2, 5): {"dx_min": -80,  "dx_max": 80,  "dy_min": 100, "dy_max": 360},
-    (5, 4): {"dx_min": -320, "dx_max": -80, "dy_min": -80, "dy_max": 20},
-    (5, 6): {"dx_min": 80,   "dx_max": 320, "dy_min": -20, "dy_max": 80},
-}
-
-
-# =========================================================
 # HELPERS
 # =========================================================
 def _cfg(config, key):
@@ -97,14 +79,18 @@ def _cfg(config, key):
     return config.get(key, DEFAULT_PLAN_B_CONFIG[key])
 
 
+log = logging.getLogger(__name__)
+
+
 def _debug(config, msg):
     if _cfg(config, "PRINT_DEBUG"):
-        print(msg)
+        log.debug(msg)
 
 
-def get_search_window(pair_hint=None, config=None):
-    if pair_hint is not None and pair_hint in PAIR_PRIORS:
-        return PAIR_PRIORS[pair_hint]
+def get_search_window(search_window=None, config=None):
+    """Explicit window (from the lens layout) or the configured default window."""
+    if search_window is not None:
+        return search_window
 
     return {
         "dx_min": _cfg(config, "DEFAULT_DX_MIN"),
@@ -380,11 +366,12 @@ def feature_ransac_translation(ref_img, mov_img, config=None):
 # =========================================================
 # DIRECTIONAL PATCH CONSENSUS
 # =========================================================
-def directional_patch_consensus(ref_img, mov_img, pair_hint=None, config=None):
+def directional_patch_consensus(ref_img, mov_img, search_window=None, config=None):
     """
-    Directional patch-based fallback estimator.
+    Directional patch-based fallback estimator. `search_window` limits the raw
+    shift to the direction of the lens baseline (see layout.search_window).
     """
-    search = get_search_window(pair_hint=pair_hint, config=config)
+    search = get_search_window(search_window=search_window, config=config)
 
     ref_g = preprocess_for_plan_b(ref_img, config=config)
     mov_g = preprocess_for_plan_b(mov_img, config=config)
@@ -608,7 +595,7 @@ def prior_guided_retry(ref_img, mov_img, prior_shift, config=None):
     patch_result = directional_patch_consensus(
         ref_img,
         shifted_mov,
-        pair_hint=None,
+        search_window=None,
         config=residual_config,
     )
     if _residual_is_plausible(patch_result, config=config):
@@ -712,14 +699,8 @@ def prior_guided_retry(ref_img, mov_img, prior_shift, config=None):
                     "history_prior_cross_method_consensus",
                 )
 
-    if _cfg(config, "PRINT_DEBUG"):
-        print("\n[HISTORY PRIOR RETRY RESULT]")
-        print({
-            "prior": prior_shift,
-            "primary_result": primary_result,
-            "patch_result": patch_result,
-            "feature_result": feature_result,
-        })
+    _debug(config, f"[HISTORY PRIOR RETRY RESULT] prior={prior_shift}, primary={primary_result}, "
+                   f"patch={patch_result}, feature={feature_result}")
 
     return {
         "dx": prior_dx,
@@ -744,7 +725,7 @@ def prior_guided_retry(ref_img, mov_img, prior_shift, config=None):
     }
 
 
-def estimate_xy_plan_b(ref_img, mov_img, pair_hint=None, config=None, prior_shift=None):
+def estimate_xy_plan_b(ref_img, mov_img, search_window=None, config=None, prior_shift=None):
     """
     Fallback alignment order:
 
@@ -756,14 +737,12 @@ def estimate_xy_plan_b(ref_img, mov_img, pair_hint=None, config=None, prior_shif
     patch_result = directional_patch_consensus(
         ref_img,
         mov_img,
-        pair_hint=pair_hint,
+        search_window=search_window,
         config=config,
     )
 
     if patch_result is not None and patch_result.get("accepted"):
-        if _cfg(config, "PRINT_DEBUG"):
-            print("\n[PLAN B RESULT]")
-            print(patch_result)
+        _debug(config, f"[PLAN B RESULT] {patch_result}")
         return patch_result
 
     feature_result = feature_ransac_translation(
@@ -772,12 +751,7 @@ def estimate_xy_plan_b(ref_img, mov_img, pair_hint=None, config=None, prior_shif
         config=config,
     )
 
-    if _cfg(config, "PRINT_DEBUG"):
-        print("\n[PLAN B / PLAN C RESULT]")
-        print({
-            "patch_result": patch_result,
-            "feature_result": feature_result,
-        })
+    _debug(config, f"[PLAN B / PLAN C RESULT] patch={patch_result}, feature={feature_result}")
 
     if feature_result is not None and feature_result.get("accepted"):
         return feature_result

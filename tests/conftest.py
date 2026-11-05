@@ -7,11 +7,25 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from settings import load_settings  # noqa: E402
+from msalign.settings import load_settings  # noqa: E402
 
 CELL = 640
-# Lens geometry used for the synthetic camera: where each lens sees the scene.
-SHIFTS = [(0, 0), (12, -7), (-9, 5), (20, 3), (-4, -15), (7, 11)]
+# Synthetic camera geometry: apply shift of each lens relative to lens 1.
+# Physical model: parallax of ~24 px per lens step along the baseline
+# (lenses further right/down see the scene shifted left/up), plus a few pixels
+# of lens-mounting offset. Lens grid: 1 2 3 / 4 5 6.
+PARALLAX = 24
+OFFSETS = [(0, 0), (2, -3), (-1, 2), (3, 1), (-2, -2), (1, 3)]
+
+
+def physical_shifts(parallax=PARALLAX, offsets=OFFSETS, cols=3):
+    return [
+        (-(i % cols) * parallax + ox, -(i // cols) * parallax + oy)
+        for i, (ox, oy) in enumerate(offsets)
+    ]
+
+
+SHIFTS = physical_shifts()
 # Per-lens channel mixing, so the lenses look "spectrally" different.
 MIX = [
     (1.0, 0.2, 0.1), (0.3, 1.0, 0.2), (0.1, 0.4, 1.0),
@@ -33,19 +47,20 @@ def make_scene(seed, size):
     return base
 
 
-def make_compound(seed, shifts=SHIFTS, cell=CELL, jitter=0):
-    """Compound 3x2 image as float in [0, 1]; lens k sees the scene shifted by shifts[k]."""
+def make_compound(seed, shifts=SHIFTS, cell=CELL, jitter=0, cols=3):
+    """Compound image (cols x rows lenses) as float in [0, 1]; lens k sees the scene shifted by shifts[k]."""
     rng = np.random.default_rng(seed + 1000)
     pad = max(60, max(max(abs(dx), abs(dy)) for dx, dy in shifts) + jitter + 10)
     scene = make_scene(seed, cell + 2 * pad)
-    img = np.zeros((2 * cell, 3 * cell, 3), np.float32)
+    rows = -(-len(shifts) // cols)
+    img = np.zeros((rows * cell, cols * cell, 3), np.float32)
     for i, (dx, dy) in enumerate(shifts):
         if jitter:
             dx += int(rng.integers(-jitter, jitter + 1))
             dy += int(rng.integers(-jitter, jitter + 1))
-        r, c = divmod(i, 3)
+        r, c = divmod(i, cols)
         view = scene[pad + dy: pad + dy + cell, pad + dx: pad + dx + cell]
-        mixed = view * np.asarray(MIX[i], np.float32)
+        mixed = view * np.asarray(MIX[i % len(MIX)], np.float32)
         img[r * cell:(r + 1) * cell, c * cell:(c + 1) * cell] = mixed
     return img / img.max()
 

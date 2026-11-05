@@ -1,49 +1,63 @@
 """
-stack_core.py
+stack.py
 
-Primary:
-- Direct reference alignment: 1 -> 2,3,4,5,6 using estimate_xy_v4
+Aligns the lens images of one compound image and writes the multiband TIFF.
 
-Plan B:
-- If primary fails, switch completely to 2/5-centered layout:
-    2 -> 1
-    2 -> 3
-    2 -> 5
-    5 -> 4
-    5 -> 6
+Alignment strategy:
 
-Plan B does NOT use 1 -> 3.
+Primary
+    Every lens is aligned directly to the primary reference lens (lens 1 by
+    default) with phase correlation + patch consensus.
+
+Fallback (Plan B / Plan C)
+    If any primary pair fails, the whole image switches to a chain of short,
+    adjacent-lens steps through the fallback reference lens (see layout.py),
+    e.g. for the 3 x 2 camera: 2->1, 2->3, 2->5, 5->4, 5->6. Each step tries
+    directional patch consensus, then AKAZE feature translation, then (if
+    history is available) a history-guided residual retry.
+
+Closure check
+    After either mode, adjacent lens pairs that were not measured directly are
+    checked on the image (closure.py). Depending on `closure_check`, a failed
+    check rejects the result ("reject") or is only reported ("warn").
 """
 
 from pathlib import Path
 import csv
+import logging
+
 import cv2
 import numpy as np
 import tifffile
 
-from alignment_core import estimate_xy_v4, DEFAULT_CONFIG
-from image_io import find_split_set
-from settings import DEFAULT_SETTINGS, file_bands_int
-from alignment_plan_b import estimate_xy_plan_b
+from .alignment import estimate_xy_v4, DEFAULT_CONFIG
+from .closure import check_closure, closure_failed, describe_failures
+from .fallback import estimate_xy_plan_b
+from .image_io import find_split_set
+from .layout import LensLayout, layout_from_settings
+from .matching import PreparedImages
+from .settings import DEFAULT_SETTINGS, file_bands_int
 
+
+log = logging.getLogger(__name__)
 
 # Defaults; the pipeline passes the values from settings (pipeline_config.json).
 FILE_BANDS = file_bands_int(DEFAULT_SETTINGS)
 OUTPUT_ORDER = list(DEFAULT_SETTINGS["output_order"])
 
-# Stable pair geometry used by the 2/5-centered fallback layout.
-# Historical priors are kept separately for every physical lens pair.
-HISTORY_PAIRS = ((2, 1), (2, 3), (2, 5), (5, 4), (5, 6))
+
+def _layout(settings=None) -> LensLayout:
+    return layout_from_settings(settings or DEFAULT_SETTINGS)
 
 
-def load_split_images(split_dir: Path, split_ext: str | None = None):
-    ext = find_split_set(split_dir, split_ext)
+def load_split_images(split_dir: Path, split_ext: str | None = None, count: int = 6):
+    ext = find_split_set(split_dir, split_ext, count)
     if ext is None:
-        wanted = split_ext or "1..6.tif / 1..6.jpg"
-        raise FileNotFoundError(f"No complete split set ({wanted}) in: {split_dir}")
+        wanted = split_ext or ".tif / .jpg"
+        raise FileNotFoundError(f"No complete split set (1..{count}{wanted}) in: {split_dir}")
 
     images = {}
-    for idx in range(1, 7):
+    for idx in range(1, count + 1):
         path = split_dir / f"{idx}{ext}"
         data = np.fromfile(str(path), dtype=np.uint8)
         img = cv2.imdecode(data, cv2.IMREAD_UNCHANGED)
@@ -53,6 +67,23 @@ def load_split_images(split_dir: Path, split_ext: str | None = None):
     return images
 
 
+def _pair_record(result, raw_dx, raw_dy, method, algorithm, reason, history=False, details=None):
+    return {
+        "raw_dx": int(raw_dx),
+        "raw_dy": int(raw_dy),
+        "apply_dx": -int(raw_dx),
+        "apply_dy": -int(raw_dy),
+        "confidence": float(result.get("confidence", result.get("score", 0.0))),
+        "support": int(result.get("support", 0)),
+        "num_votes": int(result.get("num_votes", 0)),
+        "reason": reason,
+        "method": method,
+        "algorithm": algorithm,
+        "history_prior_used": history,
+        "details": details or {},
+    }
+
+
 def estimate_pair_primary(ref_img, mov_img, config=None):
     result = estimate_xy_v4(ref_img, mov_img, config=config)
 
@@ -60,211 +91,115 @@ def estimate_pair_primary(ref_img, mov_img, config=None):
         reason = "none" if result is None else result["reason"]
         raise RuntimeError(reason)
 
-    raw_dx = int(result["dx"])
-    raw_dy = int(result["dy"])
-
-    return {
-        "raw_dx": raw_dx,
-        "raw_dy": raw_dy,
-        "apply_dx": -raw_dx,
-        "apply_dy": -raw_dy,
-        "confidence": float(result["confidence"]),
-        "support": int(result["support"]),
-        "num_votes": int(result["num_votes"]),
-        "reason": str(result["reason"]),
-        "method": "primary",
-        "algorithm": "phase_patch_consensus",
-    }
+    return _pair_record(
+        result, result["dx"], result["dy"],
+        method="primary", algorithm="phase_patch_consensus", reason=str(result["reason"]),
+    )
 
 
-def estimate_pair_plan_b(ref_img, mov_img, pair_hint, prior_shift=None):
+def estimate_pair_fallback(ref_img, mov_img, pair, search_window, prior_shift=None):
     result = estimate_xy_plan_b(
         ref_img,
         mov_img,
-        pair_hint=pair_hint,
+        search_window=search_window,
         config=None,
         prior_shift=prior_shift,
     )
 
-    pair_label = f"{pair_hint[0]}->{pair_hint[1]}"
     if result is None or not result.get("accepted"):
         if result is None:
             reason = "no alignment result"
         else:
             reason = result.get("reason", f"{result.get('method', 'unknown')} rejected")
-        raise RuntimeError(f"{pair_label}: {reason}")
-
-    raw_dx = int(result["dx"])
-    raw_dy = int(result["dy"])
+        raise RuntimeError(f"{pair[0]}->{pair[1]}: {reason}")
 
     details = result.get("details", {}) or {}
-    num_votes = int(
-        details.get(
-            "num_votes",
-            details.get("matches", result.get("support", 0)),
-        )
-    )
-
     algorithm = str(result.get("method", "plan_b"))
-    return {
-        "raw_dx": raw_dx,
-        "raw_dy": raw_dy,
-        "apply_dx": -raw_dx,
-        "apply_dy": -raw_dy,
-        "confidence": float(result.get("score", 0.0)),
-        "support": int(result.get("support", 0)),
-        "num_votes": num_votes,
-        "reason": f"fallback:{algorithm}",
-        "method": "history_retry" if algorithm.startswith("history_prior_") else "plan_b",
-        "algorithm": algorithm,
-        "history_prior_used": bool(algorithm.startswith("history_prior_")),
-        "details": details,
-    }
+    history = algorithm.startswith("history_prior_")
+    record = _pair_record(
+        result, result["dx"], result["dy"],
+        method="history_retry" if history else "plan_b",
+        algorithm=algorithm,
+        reason=f"fallback:{algorithm}",
+        history=history,
+        details=details,
+    )
+    record["num_votes"] = int(details.get("num_votes", details.get("matches", result.get("support", 0))))
+    return record
 
 
-def compute_primary_alignment(images, config=None):
-    """
-    Old direct-reference method:
-        1 -> 2
-        1 -> 3
-        1 -> 4
-        1 -> 5
-        1 -> 6
-    """
-    ref_img = images[1]
+def compute_primary_alignment(images, config=None, layout: LensLayout | None = None):
+    """Every lens aligned directly to the primary reference lens."""
+    layout = layout or _layout()
+    ref = layout.primary_reference
 
     pairs = {}
-    apply_shifts = {
-        1: {"dx": 0, "dy": 0},
-    }
-    raw_shifts = {
-        1: {"dx": 0, "dy": 0},
-    }
-
-    for idx in range(2, 7):
-        pair_key = f"1-{idx}"
-        pair = estimate_pair_primary(ref_img, images[idx], config=config)
-
-        pairs[pair_key] = pair
-        raw_shifts[idx] = {
-            "dx": pair["raw_dx"],
-            "dy": pair["raw_dy"],
-        }
-        apply_shifts[idx] = {
-            "dx": pair["apply_dx"],
-            "dy": pair["apply_dy"],
-        }
+    apply_shifts = {ref: {"dx": 0, "dy": 0}}
+    for idx in layout.lenses:
+        if idx == ref:
+            continue
+        pair = estimate_pair_primary(images[ref], images[idx], config=config)
+        pairs[f"{ref}-{idx}"] = pair
+        apply_shifts[idx] = {"dx": pair["apply_dx"], "dy": pair["apply_dy"]}
 
     return {
-        "reference_id": 1,
-        "mode": "primary_direct_1_reference",
+        "reference_id": ref,
+        "mode": f"primary_direct_{ref}_reference",
         "pairs": pairs,
-        "raw_shifts": raw_shifts,
+        "measured_edges": [(ref, idx) for idx in layout.lenses if idx != ref],
         "apply_shifts": apply_shifts,
     }
 
 
-def compute_plan_b_alignment(images, alignment_priors=None):
-    """
-    2/5-centered fallback layout.  If a pair has a robust historical prior,
-    that prior is used only after the normal Plan B and Plan C attempts fail.
-
-    Layout:
-        2 -> 1
-        2 -> 3
-        2 -> 5
-        5 -> 4
-        5 -> 6
-
-    Global reference:
-        image 2 = (0, 0)
-    """
-    pairs = {}
+def compute_plan_b_alignment(images, alignment_priors=None, layout: LensLayout | None = None,
+                             settings=None):
+    """Chain of adjacent-lens steps through the fallback reference lens."""
+    layout = layout or _layout(settings)
+    settings = settings or DEFAULT_SETTINGS
     alignment_priors = alignment_priors or {}
+    ref = layout.fallback_reference
 
-    def prior_for(pair_hint):
-        return alignment_priors.get(pair_hint)
-
-    pairs["2-1"] = estimate_pair_plan_b(
-        images[2], images[1], pair_hint=(2, 1), prior_shift=prior_for((2, 1))
-    )
-    pairs["2-3"] = estimate_pair_plan_b(
-        images[2], images[3], pair_hint=(2, 3), prior_shift=prior_for((2, 3))
-    )
-    pairs["2-5"] = estimate_pair_plan_b(
-        images[2], images[5], pair_hint=(2, 5), prior_shift=prior_for((2, 5))
-    )
-    pairs["5-4"] = estimate_pair_plan_b(
-        images[5], images[4], pair_hint=(5, 4), prior_shift=prior_for((5, 4))
-    )
-    pairs["5-6"] = estimate_pair_plan_b(
-        images[5], images[6], pair_hint=(5, 6), prior_shift=prior_for((5, 6))
-    )
-
-    apply_shifts = {
-        2: {"dx": 0, "dy": 0},
-    }
-
-    apply_shifts[1] = {
-        "dx": pairs["2-1"]["apply_dx"],
-        "dy": pairs["2-1"]["apply_dy"],
-    }
-
-    apply_shifts[3] = {
-        "dx": pairs["2-3"]["apply_dx"],
-        "dy": pairs["2-3"]["apply_dy"],
-    }
-
-    apply_shifts[5] = {
-        "dx": pairs["2-5"]["apply_dx"],
-        "dy": pairs["2-5"]["apply_dy"],
-    }
-
-    apply_shifts[4] = {
-        "dx": apply_shifts[5]["dx"] + pairs["5-4"]["apply_dx"],
-        "dy": apply_shifts[5]["dy"] + pairs["5-4"]["apply_dy"],
-    }
-
-    apply_shifts[6] = {
-        "dx": apply_shifts[5]["dx"] + pairs["5-6"]["apply_dx"],
-        "dy": apply_shifts[5]["dy"] + pairs["5-6"]["apply_dy"],
-    }
-
-    raw_shifts = {}
+    pairs = {}
+    apply_shifts = {ref: {"dx": 0, "dy": 0}}
+    for parent, child in layout.fallback_tree:
+        window = layout.search_window(
+            parent, child, settings["parallax_range_px"], settings["parallax_cross_px"]
+        )
+        pair = estimate_pair_fallback(
+            images[parent], images[child], (parent, child), window,
+            prior_shift=alignment_priors.get((parent, child)),
+        )
+        pairs[f"{parent}-{child}"] = pair
+        apply_shifts[child] = {
+            "dx": apply_shifts[parent]["dx"] + pair["apply_dx"],
+            "dy": apply_shifts[parent]["dy"] + pair["apply_dy"],
+        }
 
     return {
-        "reference_id": 2,
-        "mode": "plan_b_2_5_centered_layout",
+        "reference_id": ref,
+        "mode": f"fallback_chain_{ref}_reference",
         "pairs": pairs,
-        "raw_shifts": raw_shifts,
+        "measured_edges": list(layout.fallback_tree),
         "apply_shifts": apply_shifts,
         "history_priors_available": len(alignment_priors),
-        "history_retry_used": any(
-            pair.get("history_prior_used", False) for pair in pairs.values()
-        ),
+        "history_retry_used": any(p.get("history_prior_used", False) for p in pairs.values()),
     }
 
 
-def derive_history_pair_shifts(alignment_result):
+def derive_history_pair_shifts(alignment_result, edges):
     """
-    Derive raw relative shifts for the fixed fallback lens pairs from any
-    successful alignment mode.  This means primary-mode successes can teach the
-    fallback layout even though they used image 1 as their global reference.
+    Raw relative shifts for the fallback chain's lens pairs, derived from any
+    successful alignment mode, so primary-mode successes also teach the chain.
+    raw(ref->mov) = apply_ref - apply_mov
     """
     apply_shifts = alignment_result.get("apply_shifts", {})
     pair_shifts = {}
-
-    for ref_id, mov_id in HISTORY_PAIRS:
-        if ref_id not in apply_shifts or mov_id not in apply_shifts:
-            continue
-
-        # raw(ref->mov) = global_raw_mov - global_raw_ref
-        #                  = apply_ref - apply_mov
-        pair_shifts[(ref_id, mov_id)] = {
-            "dx": int(apply_shifts[ref_id]["dx"] - apply_shifts[mov_id]["dx"]),
-            "dy": int(apply_shifts[ref_id]["dy"] - apply_shifts[mov_id]["dy"]),
-        }
-
+    for ref_id, mov_id in edges:
+        if ref_id in apply_shifts and mov_id in apply_shifts:
+            pair_shifts[(ref_id, mov_id)] = {
+                "dx": int(apply_shifts[ref_id]["dx"] - apply_shifts[mov_id]["dx"]),
+                "dy": int(apply_shifts[ref_id]["dy"] - apply_shifts[mov_id]["dy"]),
+            }
     return pair_shifts
 
 
@@ -292,33 +227,29 @@ def _robust_prior(values):
 
     final_dx = float(np.median(filtered_dx))
     final_dy = float(np.median(filtered_dy))
-    final_mad_dx = float(np.median(np.abs(filtered_dx - final_dx)))
-    final_mad_dy = float(np.median(np.abs(filtered_dy - final_dy)))
 
     return {
         "dx": int(round(final_dx)),
         "dy": int(round(final_dy)),
         "samples": int(len(filtered_dx)),
         "source_samples": int(len(values)),
-        "mad_dx": final_mad_dx,
-        "mad_dy": final_mad_dy,
+        "mad_dx": float(np.median(np.abs(filtered_dx - final_dx))),
+        "mad_dy": float(np.median(np.abs(filtered_dy - final_dy))),
     }
 
 
-def build_alignment_priors(alignment_results, max_samples=5):
+def build_alignment_priors(alignment_results, max_samples=5, layout: LensLayout | None = None):
     """
-    Build pair-specific priors from up to the supplied successful alignments.
-    The caller controls temporal/neighbour selection; this function performs the
-    robust aggregation only.
+    Pair-specific priors from the given successful alignments (the caller
+    chooses which neighbours); robust aggregation only.
     """
     if not alignment_results:
         return {}
 
-    selected = list(alignment_results)[-max_samples:]
-    buckets = {pair: [] for pair in HISTORY_PAIRS}
-
-    for alignment in selected:
-        for pair, shift in derive_history_pair_shifts(alignment).items():
+    edges = (layout or _layout()).fallback_tree
+    buckets = {pair: [] for pair in edges}
+    for alignment in list(alignment_results)[-max_samples:]:
+        for pair, shift in derive_history_pair_shifts(alignment, edges).items():
             buckets[pair].append(shift)
 
     priors = {}
@@ -326,49 +257,62 @@ def build_alignment_priors(alignment_results, max_samples=5):
         prior = _robust_prior(values)
         if prior is not None:
             priors[pair] = prior
-
     return priors
 
 
-def estimate_alignment_from_split(
-    split_dir: Path,
-    config=None,
-    alignment_priors=None,
-    split_ext=None,
-):
-    """
-    Try the primary direct-reference alignment first.  If any pair fails, switch
-    completely to the 2/5-centered fallback layout.  Normal fallback methods are
-    always attempted before historical priors are allowed to influence a pair.
-    """
-    images = load_split_images(split_dir, split_ext)
-    return estimate_alignment_from_images(images, config=config, alignment_priors=alignment_priors)
+def run_closure_check(images, result, layout, settings, prepared=None):
+    rows = check_closure(
+        images, result["apply_shifts"], layout, result["measured_edges"], settings, prepared
+    )
+    result["closure"] = rows
+    if rows:
+        log.info(
+            "Closure check: %s",
+            ", ".join(f"{r['pair']}={r['status']}({r['residual']:.1f}px)" for r in rows),
+        )
+    return rows
 
 
-def estimate_alignment_from_images(images, config=None, alignment_priors=None):
-    """Same as estimate_alignment_from_split, for lens images already in memory."""
-    if config is None:
-        config = DEFAULT_CONFIG.copy()
+def estimate_alignment_from_split(split_dir: Path, config=None, alignment_priors=None,
+                                  split_ext=None, settings=None):
+    settings = settings or DEFAULT_SETTINGS
+    images = load_split_images(split_dir, split_ext, _layout(settings).count)
+    return estimate_alignment_from_images(images, config, alignment_priors, settings)
+
+
+def estimate_alignment_from_images(images, config=None, alignment_priors=None, settings=None):
+    """
+    Primary first; if any pair fails (or, with closure_check="reject", the
+    closure check fails), switch completely to the fallback chain. Normal
+    fallback methods are always attempted before historical priors can
+    influence a pair.
+    """
+    settings = settings or DEFAULT_SETTINGS
+    layout = _layout(settings)
+    config = config or DEFAULT_CONFIG.copy()
+    reject = settings["closure_check"] == "reject"
+    prepared = PreparedImages(images)
 
     try:
-        print("Trying primary alignment...")
-        result = compute_primary_alignment(images, config=config)
+        log.info("Trying primary alignment...")
+        result = compute_primary_alignment(images, config=config, layout=layout)
+        rows = run_closure_check(images, result, layout, settings, prepared)
+        if reject and closure_failed(rows):
+            raise RuntimeError(describe_failures(rows))
         result["history_priors_available"] = len(alignment_priors or {})
         result["history_retry_used"] = False
         return result
-
     except Exception as e:
-        print(f"Primary alignment failed: {e}")
-        print("Switching to Plan B/C 2/5-centered alignment...")
+        log.info("Primary alignment not used: %s", e)
+        log.info("Switching to fallback chain via lens %s...", layout.fallback_reference)
         if alignment_priors:
-            print(
-                f"Historical lens geometry available for "
-                f"{len(alignment_priors)} pair(s)."
-            )
-        return compute_plan_b_alignment(
-            images,
-            alignment_priors=alignment_priors,
-        )
+            log.info("Historical lens geometry available for %d pair(s).", len(alignment_priors))
+
+    result = compute_plan_b_alignment(images, alignment_priors, layout, settings)
+    rows = run_closure_check(images, result, layout, settings, prepared)
+    if reject and closure_failed(rows):
+        raise RuntimeError(describe_failures(rows))
+    return result
 
 
 def build_band_map(file_bands=None):
@@ -462,11 +406,23 @@ def summarize_alignment_quality(alignment_result):
     quality_rank = {"low": 1, "medium": 2, "high": 3}
     worst_rank = min(quality_rank[row["quality"]] for row in rows)
 
+    closure = alignment_result.get("closure", [])
+    # A failed closure check that was only reported ("warn") caps quality at low.
+    if closure_failed(closure):
+        worst_rank = 1
+
     return {
         "overall_quality": {v: k for k, v in quality_rank.items()}[worst_rank],
         "mean_confidence": sum(row["confidence"] for row in rows) / len(rows),
         "min_support": min(row["support"] for row in rows),
         "rows": rows,
+        "closure": closure,
+        "closure_max_residual": max((c["residual"] for c in closure if c["status"] != "inconclusive"), default=None),
+        "closure_status": (
+            "fail" if closure_failed(closure)
+            else "pass" if any(c["status"] == "pass" for c in closure)
+            else "inconclusive" if closure else "not_checked"
+        ),
     }
 
 
@@ -505,6 +461,8 @@ def write_alignment_quality_report(output_tiff: Path, export_result):
             "shift verified on this image before use"
         )
 
+    lines.append(f"Closure check: {summary['closure_status']}")
+
     lines += ["", "Per-pair results:"]
 
     for row in summary["rows"]:
@@ -523,7 +481,22 @@ def write_alignment_quality_report(output_tiff: Path, export_result):
             f"{history_note}, reason={row['reason']}"
         )
 
-    txt_path.write_text("\n".join(lines), encoding="utf-8")
+    if summary["closure"]:
+        lines += [
+            "",
+            "Closure check (independent bounded-NCC test of every shift; 'closure' = adjacent",
+            "pair not measured by the alignment, 'measured' = pair the alignment measured):",
+        ]
+        for c in summary["closure"]:
+            note = f", {c['note']}" if c.get("note") else ""
+            lines.append(
+                f"- {c['pair']} ({c['kind']}): {c['status']}, "
+                f"implied_shift=({c['predicted_dx']}, {c['predicted_dy']}), "
+                f"residual=({c['residual_dx']:.2f}, {c['residual_dy']:.2f}) = {c['residual']:.2f} px, "
+                f"ncc={c['ncc']:.3f}{note}"
+            )
+
+    txt_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     fieldnames = [
         "pair", "method", "algorithm", "quality", "confidence",
@@ -537,6 +510,19 @@ def write_alignment_quality_report(output_tiff: Path, export_result):
         writer.writerows(
             {**row, "pair": row["pair"].replace("-", "->")} for row in summary["rows"]
         )
+        for c in summary["closure"]:
+            writer.writerow({
+                "pair": c["pair"].replace("-", "->"),
+                "method": f"{c['kind']}_check",
+                "algorithm": "bounded_ncc",
+                "quality": c["status"],
+                "confidence": c["ncc"],
+                "raw_dx": c["predicted_dx"],
+                "raw_dy": c["predicted_dy"],
+                "residual_dx": c["residual_dx"],
+                "residual_dy": c["residual_dy"],
+                "reason": c.get("note") or f"residual={c['residual']:.2f}px",
+            })
 
     return {"summary": summary, "txt": str(txt_path), "csv": str(csv_path)}
 
@@ -552,13 +538,15 @@ def export_multipage_tiff_from_split(
     file_bands=None,
     output_order=None,
     split_info=None,
+    settings=None,
 ):
-    """Align the six lens images and export the multiband TIFF.
+    """Align the lens images and export the multiband TIFF.
 
     `images` may be passed to skip reading the split images from split_dir.
     """
+    settings = settings or DEFAULT_SETTINGS
     if images is None:
-        images = load_split_images(split_dir, split_ext)
+        images = load_split_images(split_dir, split_ext, _layout(settings).count)
 
     if status_callback:
         status_callback("Aligning lens images")
@@ -567,6 +555,7 @@ def export_multipage_tiff_from_split(
         images,
         config=config,
         alignment_priors=alignment_priors,
+        settings=settings,
     )
 
     return export_aligned_tiff(
@@ -606,10 +595,11 @@ def export_aligned_tiff(
     """Apply alignment_result['apply_shifts'], crop the common area and write the TIFF."""
     apply_shifts = alignment_result["apply_shifts"]
 
-    print(f"Alignment mode: {alignment_result['mode']}")
-    print("Apply shifts:")
-    for idx in sorted(apply_shifts.keys()):
-        print(f"  {idx}: dx={apply_shifts[idx]['dx']}, dy={apply_shifts[idx]['dy']}")
+    log.info(
+        "Alignment mode: %s | shifts: %s",
+        alignment_result["mode"],
+        ", ".join(f"{k}=({v['dx']},{v['dy']})" for k, v in sorted(apply_shifts.items())),
+    )
 
     ref_h, ref_w = images[1].shape[:2]
     for idx, img in images.items():

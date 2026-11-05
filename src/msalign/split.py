@@ -1,15 +1,18 @@
 """
-split_core.py
+split.py
 
-Split a 3x2 compound multispectral image into 6 cropped lens images.
+Split a compound multi-lens image into cropped lens images (grid_cols x grid_rows).
 """
 
+import logging
 from pathlib import Path
 
 import cv2
 import numpy as np
 
-from image_io import read_image
+from .image_io import read_image
+
+log = logging.getLogger(__name__)
 
 
 def center_crop(img, frac: float):
@@ -114,8 +117,8 @@ def split_compound_array(
         "lens_size": int(target_size),
     }
     if mode != "fixed_grid":
-        print(
-            f"WARNING: source is {w}x{h}, expected {expected_w}x{expected_h}; "
+        log.warning(
+            f"source is {w}x{h}, expected {expected_w}x{expected_h}; "
             f"using {info['split_mode']} split."
         )
     return cells, info

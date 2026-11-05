@@ -1,6 +1,8 @@
 {
-  "_comment": "Copy this file to pipeline_config.json (next to the .exe, or in the repository root) and keep only the settings you want to change. Defaults are in src/settings.py.",
+  "_comment": "Copy to pipeline_config.json (next to the .exe, or pass it with --config) and keep only the settings you change. All settings and defaults: src/msalign/settings.py, or run: msalign --list-settings",
 
+  "grid_cols": 3,
+  "grid_rows": 2,
   "cell_size": 3168,
   "center_crop_frac": 0.80,
 
@@ -12,12 +14,18 @@
     "5": ["450", "560", "685"],
     "6": ["490", "0", "735"]
   },
+  "output_order": ["405", "430", "450", "490", "525", "550", "560", "570",
+                   "630", "650", "685", "710", "735", "850"],
+
+  "parallax_range_px": [20, 360],
+
+  "closure_check": "reject",
+  "closure_tolerance_px": 4.0,
 
   "collection_mode": "hardlink",
 
   "batch_threshold": 50,
   "batch_calibration_samples": 16,
-  "batch_consensus_tolerance_px": 3.0,
   "batch_verify_max_residual_px": 5.0,
   "batch_keep_split_images": false
 }

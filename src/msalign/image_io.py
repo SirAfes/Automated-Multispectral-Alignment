@@ -109,16 +109,16 @@ def read_image(path):
     return img
 
 
-def find_split_set(split_dir: Path, preferred_ext: str | None = None):
+def find_split_set(split_dir: Path, preferred_ext: str | None = None, count: int = 6):
     """
-    Return the extension of a complete 1..6 split set in split_dir, or None.
+    Return the extension of a complete 1..count split set in split_dir, or None.
 
     If preferred_ext is given, only that extension is accepted, so a RAW input
     never silently reuses JPG splits from the camera's JPG twin (or vice versa).
     """
     candidates = (preferred_ext,) if preferred_ext else SPLIT_EXTENSIONS
     for ext in candidates:
-        if all((split_dir / f"{idx}{ext}").is_file() for idx in range(1, 7)):
+        if all((split_dir / f"{idx}{ext}").is_file() for idx in range(1, count + 1)):
             return ext
     return None
 

@@ -22,6 +22,7 @@ CONFIG_FILENAME = "pipeline_config.json"
 
 DEFAULT_SETTINGS = {
     # --- Compound image layout -------------------------------------------
+    # Lenses are numbered row by row from 1 (3 x 2: top row 1 2 3, bottom 4 5 6).
     "grid_cols": 3,
     "grid_rows": 2,
     # Expected cell size in pixels (3 x 3168 = 9504, 2 x 3168 = 6336).
@@ -29,6 +30,34 @@ DEFAULT_SETTINGS = {
     # Fraction of each lens cell kept (centred) after splitting.
     "center_crop_frac": 0.80,
     "jpeg_quality": 100,
+
+    # --- Alignment geometry -----------------------------------------------
+    # Primary alignment: every lens directly against this lens.
+    "primary_reference_lens": 1,
+    # Fallback chain: adjacent-lens steps through this lens. null = grid centre
+    # (lens 2 for 3 x 2).
+    "fallback_reference_lens": None,
+    # Expected parallax between two adjacent lenses, in pixels along their
+    # baseline: the fallback only searches this range in the baseline
+    # direction (keeps it away from fixed-pattern matches at 0 px). Depends on
+    # the camera and the working distance - widen it if results sit at an edge.
+    "parallax_range_px": [20, 360],
+    # Allowed shift across the baseline direction (px).
+    "parallax_cross_px": 80,
+
+    # --- Closure check --------------------------------------------------------
+    # Adjacent lens pairs not measured directly are checked on the image.
+    #   "reject": a failed check rejects the alignment (primary -> fallback,
+    #             fallback -> retry / error); "warn": only reported; "off".
+    "closure_check": "reject",
+    "closure_tolerance_px": 4.0,
+    # A pair also fails when its correlation at the implied shift is below this
+    # fraction of the median correlation of the directly measured pairs of the
+    # same image (= the implied shift is not supported by the image).
+    "closure_relative_ncc": 0.4,
+    # If even the measured pairs correlate below this, the image has too little
+    # shared structure: the check is "inconclusive" and rejects nothing.
+    "closure_min_ncc": 0.10,
 
     # --- Band mapping -------------------------------------------------------
     # Lens image number -> wavelength label stored in its (R, G, B) channels.
@@ -106,10 +135,13 @@ def validate_settings(settings: dict) -> dict:
     bands = settings["file_bands"]
     n_lenses = settings["grid_cols"] * settings["grid_rows"]
 
-    if n_lenses != 6:
-        raise ValueError("The pipeline currently supports exactly 6 lens images (e.g. a 3 x 2 grid)")
+    if n_lenses < 2:
+        raise ValueError("grid_rows x grid_cols must give at least 2 lenses")
     if sorted(int(k) for k in bands) != list(range(1, n_lenses + 1)):
-        raise ValueError(f"file_bands must define lens images 1..{n_lenses}")
+        raise ValueError(
+            f"file_bands must define lens images 1..{n_lenses} "
+            f"(grid {settings['grid_cols']} x {settings['grid_rows']})"
+        )
 
     available = set()
     for lens, labels in bands.items():
@@ -124,6 +156,18 @@ def validate_settings(settings: dict) -> dict:
     missing = [b for b in settings["output_order"] if b not in available]
     if missing:
         raise ValueError(f"output_order contains bands not in file_bands: {missing}")
+
+    for key in ("primary_reference_lens", "fallback_reference_lens"):
+        value = settings[key]
+        if value is not None and not 1 <= int(value) <= n_lenses:
+            raise ValueError(f"{key} must be between 1 and {n_lenses}")
+
+    lo, hi = settings["parallax_range_px"]
+    if not 0 <= lo < hi:
+        raise ValueError("parallax_range_px must be [min, max] with 0 <= min < max")
+
+    if settings["closure_check"] not in {"reject", "warn", "off"}:
+        raise ValueError("closure_check must be 'reject', 'warn' or 'off'")
 
     if settings["collection_mode"] not in {"hardlink", "copy", "off"}:
         raise ValueError("collection_mode must be 'hardlink', 'copy' or 'off'")

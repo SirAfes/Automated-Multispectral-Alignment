@@ -5,18 +5,18 @@ import numpy as np
 import pytest
 import tifffile
 
-from conftest import CELL, SHIFTS, make_compound, write_fake_raw, write_jpg
-from batch_core import calibration_indices, compute_consensus
-from image_io import file_dialog_types
-from pipeline_core import (
+from conftest import CELL, SHIFTS, make_compound, physical_shifts, write_fake_raw, write_jpg
+from msalign.batch import calibration_indices, compute_consensus
+from msalign.image_io import file_dialog_types
+from msalign.pipeline import (
     collect_folder_images,
     output_paths,
     process_single_file,
     run_pipeline,
     sort_paths,
 )
-from settings import load_settings
-from split_core import split_compound_array
+from msalign.settings import load_settings
+from msalign.split import split_compound_array
 
 
 def relative_shifts(alignment):
@@ -134,7 +134,7 @@ def test_consensus_detects_mixed_distances(settings):
 
 def test_batch_mode_applies_consensus_and_catches_outlier(tmp_path, settings):
     paths = []
-    near = [(0, 0), (16, -10), (-12, 8), (26, 5), (-6, -19), (10, 14)]
+    near = physical_shifts(parallax=33)  # closer subject -> larger parallax
     for i in range(12):
         shifts = SHIFTS
         if i == 5:  # one frame shot at another distance
