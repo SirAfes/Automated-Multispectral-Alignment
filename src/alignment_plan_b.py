@@ -14,6 +14,7 @@ Historical geometry is used only after the normal pair estimators reject a resul
 import cv2
 import numpy as np
 
+from image_io import to_uint8
 from alignment_core import (
     DEFAULT_CONFIG,
     estimate_xy_v4,
@@ -265,7 +266,7 @@ def preprocess_for_features(img):
     else:
         g = img.copy()
 
-    g = g.astype(np.uint8) if g.dtype != np.uint8 else g
+    g = to_uint8(g)
 
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     g = clahe.apply(g)

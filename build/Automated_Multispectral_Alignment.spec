@@ -1,13 +1,17 @@
 # -*- mode: python ; coding: utf-8 -*-
 
-from PyInstaller.utils.hooks import collect_submodules
+from PyInstaller.utils.hooks import collect_dynamic_libs, collect_submodules
 
-hiddenimports = collect_submodules('cv2') + collect_submodules('tifffile')
+hiddenimports = (
+    collect_submodules('cv2')
+    + collect_submodules('tifffile')
+    + collect_submodules('rawpy')
+)
 
 a = Analysis(
     ['../src/run_pipeline_gui.py'],
     pathex=['../src'],
-    binaries=[],
+    binaries=collect_dynamic_libs('rawpy'),
     datas=[],
     hiddenimports=hiddenimports,
     hookspath=[],

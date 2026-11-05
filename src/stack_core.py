@@ -22,6 +22,7 @@ import numpy as np
 import tifffile
 
 from alignment_core import estimate_xy_v4, DEFAULT_CONFIG
+from image_io import find_split_set
 from alignment_plan_b import estimate_xy_plan_b
 
 
@@ -46,11 +47,17 @@ OUTPUT_ORDER = [
 HISTORY_PAIRS = ((2, 1), (2, 3), (2, 5), (5, 4), (5, 6))
 
 
-def load_split_images(split_dir: Path):
+def load_split_images(split_dir: Path, split_ext: str | None = None):
+    ext = find_split_set(split_dir, split_ext)
+    if ext is None:
+        wanted = split_ext or "1..6.tif / 1..6.jpg"
+        raise FileNotFoundError(f"No complete split set ({wanted}) in: {split_dir}")
+
     images = {}
     for idx in range(1, 7):
-        path = split_dir / f"{idx}.jpg"
-        img = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+        path = split_dir / f"{idx}{ext}"
+        data = np.fromfile(str(path), dtype=np.uint8)
+        img = cv2.imdecode(data, cv2.IMREAD_UNCHANGED)
         if img is None:
             raise FileNotFoundError(f"Could not load split image: {path}")
         images[idx] = img
@@ -338,6 +345,7 @@ def estimate_alignment_from_split(
     split_dir: Path,
     config=None,
     alignment_priors=None,
+    split_ext=None,
 ):
     """
     Try the primary direct-reference alignment first.  If any pair fails, switch
@@ -347,7 +355,7 @@ def estimate_alignment_from_split(
     if config is None:
         config = DEFAULT_CONFIG.copy()
 
-    images = load_split_images(split_dir)
+    images = load_split_images(split_dir, split_ext)
 
     try:
         print("Trying primary alignment...")
@@ -517,6 +525,7 @@ def export_multipage_tiff_from_split(
     config=None,
     alignment_priors=None,
     status_callback=None,
+    split_ext=None,
 ):
     if status_callback:
         status_callback("Aligning lens images")
@@ -525,6 +534,7 @@ def export_multipage_tiff_from_split(
         split_dir,
         config=config,
         alignment_priors=alignment_priors,
+        split_ext=split_ext,
     )
     apply_shifts = alignment_result["apply_shifts"]
 
@@ -533,13 +543,13 @@ def export_multipage_tiff_from_split(
     for idx in sorted(apply_shifts.keys()):
         print(f"  {idx}: dx={apply_shifts[idx]['dx']}, dy={apply_shifts[idx]['dy']}")
 
-    images = load_split_images(split_dir)
+    images = load_split_images(split_dir, split_ext)
 
     ref_h, ref_w = images[1].shape[:2]
     for idx, img in images.items():
         h, w = img.shape[:2]
         if (h, w) != (ref_h, ref_w):
-            raise ValueError(f"Image size mismatch in split set: {idx}.jpg")
+            raise ValueError(f"Image size mismatch in split set: image {idx}")
 
     warped = {}
     masks = {}

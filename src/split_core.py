@@ -6,6 +6,9 @@ Split a 3x2 compound multispectral image into 6 cropped lens images.
 
 from pathlib import Path
 import cv2
+import numpy as np
+
+from image_io import read_image
 
 
 def center_crop(img, frac: float):
@@ -24,12 +27,17 @@ def save_image(path: Path, img, jpeg_quality: int = 100):
 
     ext = path.suffix.lower()
     if ext in [".jpg", ".jpeg"]:
-        ok = cv2.imwrite(str(path), img, [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality])
+        if img.dtype != np.uint8:
+            raise ValueError(f"JPEG cannot store {img.dtype} data; use .tif for {path.name}")
+        params = [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality]
     else:
-        ok = cv2.imwrite(str(path), img)
+        params = []
 
+    # imencode + tofile also works for non-ASCII Windows paths, unlike cv2.imwrite.
+    ok, buf = cv2.imencode(ext, img, params)
     if not ok:
         raise IOError(f"Could not save file: {path}")
+    buf.tofile(str(path))
 
 
 def split_compound_image(
@@ -45,6 +53,9 @@ def split_compound_image(
     """
     Split a compound image into 6 cells and apply center crop before saving.
 
+    Accepts standard images and camera RAW files (see image_io). RAW inputs are
+    16-bit and should be saved with save_ext=".tif"; JPG cannot hold 16-bit data.
+
     Primary mode:
     - Uses the expected fixed grid size based on cell_size
 
@@ -55,12 +66,7 @@ def split_compound_image(
     Returns:
         dict[int, Path]: Mapping from image id (1..6) to saved file path
     """
-    if not input_image.exists():
-        raise FileNotFoundError(f"Input image not found: {input_image}")
-
-    img = cv2.imread(str(input_image), cv2.IMREAD_UNCHANGED)
-    if img is None:
-        raise FileNotFoundError(f"Could not load image: {input_image}")
+    img = read_image(input_image)
 
     h, w = img.shape[:2]
     expected_w = grid_cols * cell_size
