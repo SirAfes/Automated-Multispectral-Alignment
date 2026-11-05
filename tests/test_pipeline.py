@@ -251,3 +251,10 @@ def test_consensus_ignores_single_bad_calibration_result(settings):
     result = compute_consensus([alignment(SHIFTS)] * 7 + [alignment(wrong)], settings)
     assert result["consistent"] and result["agreeing"] == 7
     assert result["shifts"][6] == {"dx": SHIFTS[5][0], "dy": SHIFTS[5][1]}
+
+
+def test_csv_pair_labels_are_not_excel_dates(tmp_path, settings):
+    src = write_jpg(tmp_path / "DSC0001.JPG", make_compound(1))
+    result = process_single_file(src, settings=settings)
+    csv_text = Path(result["quality_report"]).with_suffix(".csv").read_text()
+    assert "1->2," in csv_text and "\n1-2," not in csv_text

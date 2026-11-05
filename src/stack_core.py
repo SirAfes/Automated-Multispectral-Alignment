@@ -533,7 +533,10 @@ def write_alignment_quality_report(output_tiff: Path, export_result):
     with csv_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
-        writer.writerows(summary["rows"])
+        # "2-1" would be turned into a date (2 January) by Excel; "2->1" is not.
+        writer.writerows(
+            {**row, "pair": row["pair"].replace("-", "->")} for row in summary["rows"]
+        )
 
     return {"summary": summary, "txt": str(txt_path), "csv": str(csv_path)}
 
