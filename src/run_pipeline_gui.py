@@ -5,7 +5,6 @@ from __future__ import annotations
 from collections import deque
 from pathlib import Path
 import queue
-import shutil
 import statistics
 import threading
 import time
@@ -13,29 +12,12 @@ import traceback
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from image_io import file_dialog_types, find_split_set, is_raw_file, split_ext_for_input
-from split_core import split_compound_image
-from stack_core import build_alignment_priors, export_multipage_tiff_from_split
+from image_io import file_dialog_types
+from pipeline_core import collect_folder_images, run_pipeline, sort_paths, use_batch_mode
+from settings import load_settings
 
 
-CENTER_CROP_FRAC = 0.80
-JPEG_QUALITY = 100
-HISTORY_LENGTH = 5
 RATE_HISTORY_LENGTH = 72
-
-
-def _split_set_is_complete(split_dir: Path, split_ext: str) -> bool:
-    return find_split_set(split_dir, split_ext) is not None
-
-
-def _output_name(input_path: Path) -> str:
-    """
-    Output base name. RAW files get their extension appended (DSC06664_ARW) so a
-    RAW+JPG pair from the same shot never overwrites each other's results.
-    """
-    if is_raw_file(input_path):
-        return f"{input_path.stem}_{input_path.suffix.lstrip('.').upper()}"
-    return input_path.stem
 
 
 def _format_seconds(seconds: float | None) -> str:
@@ -54,226 +36,12 @@ def _format_seconds(seconds: float | None) -> str:
     return f"About {hours} h {minutes:02d} min"
 
 
-def _short_error(exc: Exception, limit: int = 180) -> str:
-    text = " ".join(str(exc).split()) or exc.__class__.__name__
-    return text if len(text) <= limit else text[: limit - 3] + "..."
-
-
-def _copy_tiff_to_collection(output_tiff: Path, input_path: Path) -> tuple[Path, str | None]:
-    """Copy the final TIFF into <source-folder>/tiff without removing the original."""
-    collection_dir = input_path.parent / "tiff"
-    collection_path = collection_dir / output_tiff.name
-
-    try:
-        collection_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(output_tiff, collection_path)
-
-        if not collection_path.is_file():
-            raise OSError("destination file was not created")
-        if collection_path.stat().st_size != output_tiff.stat().st_size:
-            raise OSError("copied TIFF size does not match the original")
-
-        return collection_path, None
-    except Exception as exc:
-        return collection_path, _short_error(exc)
-
-
-def process_single_file(
-    input_path: Path,
-    alignment_priors=None,
-    reuse_split: bool = False,
-    status_callback=None,
-):
-    """Process one source image completely and return its output/alignment metadata."""
-    name = _output_name(input_path)
-    split_ext = split_ext_for_input(input_path)
-    base_output_dir = input_path.parent / name
-    split_dir = base_output_dir / "split_lens_images"
-    output_tiff = base_output_dir / f"{name}_aligned_multiband.tif"
-
-    print(f"\n=== Processing: {input_path.name} ===")
-    print(f"Output folder: {base_output_dir}")
-
-    if reuse_split and _split_set_is_complete(split_dir, split_ext):
-        if status_callback:
-            status_callback("Using existing six lens images")
-        print("Using existing split lens images.")
-    else:
-        if status_callback:
-            status_callback("Splitting compound image into six lens images")
-        split_compound_image(
-            input_image=input_path,
-            output_dir=split_dir,
-            center_crop_frac=CENTER_CROP_FRAC,
-            save_ext=split_ext,
-            jpeg_quality=JPEG_QUALITY,
-        )
-        print("Split completed.")
-
-    if status_callback:
-        status_callback("Aligning lens images and preparing 14-band TIFF")
-
-    export_result = export_multipage_tiff_from_split(
-        split_dir=split_dir,
-        output_tiff=output_tiff,
-        alignment_priors=alignment_priors,
-        status_callback=status_callback,
-        split_ext=split_ext,
-    )
-
-    if status_callback:
-        status_callback("Copying final TIFF to shared tiff folder")
-
-    collection_path, collection_copy_error = _copy_tiff_to_collection(
-        output_tiff=output_tiff,
-        input_path=input_path,
-    )
-
-    quality_report = export_result.get("quality_report", {})
-    quality_summary = quality_report.get("summary", {})
-
-    print("TIFF export completed.")
-    print(f"Primary TIFF: {output_tiff}")
-    if collection_copy_error:
-        print(f"WARNING: shared TIFF copy failed: {collection_copy_error}")
-    else:
-        print(f"Shared TIFF copy: {collection_path}")
-
-    return {
-        "input": str(input_path),
-        "output_dir": str(base_output_dir),
-        "tiff": str(output_tiff),
-        "tiff_collection_copy": str(collection_path),
-        "tiff_collection_copy_ok": collection_copy_error is None,
-        "tiff_collection_copy_error": collection_copy_error or "",
-        "quality_report": quality_report.get("txt", ""),
-        "quality": quality_summary.get("overall_quality", "not_available"),
-        "alignment": export_result["alignment"],
-        "history_retry_used": bool(
-            export_result["alignment"].get("history_retry_used", False)
-        ),
-    }
-
-
-def _nearest_success_alignments(success_records, failed_index, limit=HISTORY_LENGTH):
-    """Return successful neighbours on both sides, nearest first."""
-    ordered_indices = sorted(
-        success_records,
-        key=lambda idx: (abs(idx - failed_index), idx),
-    )[:limit]
-    return [success_records[idx]["alignment"] for idx in ordered_indices]
-
-
-def _worker(file_paths, event_queue: queue.Queue, stop_event: threading.Event):
+def _worker(file_paths, event_queue: queue.Queue, stop_event: threading.Event, settings):
     """Background processing worker. No Tk calls are made from this thread."""
-    success_records = {}
-    pending_retry = []
-    total = len(file_paths)
-
-    for index, fp in enumerate(file_paths):
-        if stop_event.is_set():
-            break
-
-        input_path = Path(fp)
-        previous_indices = sorted(i for i in success_records if i < index)
-        previous_alignments = [
-            success_records[i]["alignment"]
-            for i in previous_indices[-HISTORY_LENGTH:]
-        ]
-        priors = build_alignment_priors(
-            previous_alignments,
-            max_samples=HISTORY_LENGTH,
-        )
-
-        event_queue.put(("file_start", index, input_path.name, "initial"))
-        started = time.perf_counter()
-
-        def status(stage):
-            event_queue.put(("stage", index, stage, "initial"))
-
-        try:
-            result = process_single_file(
-                input_path,
-                alignment_priors=priors,
-                reuse_split=False,
-                status_callback=status,
-            )
-            elapsed = time.perf_counter() - started
-            success_records[index] = result
-            event_queue.put(("success", index, result, elapsed, False))
-        except Exception as exc:
-            elapsed = time.perf_counter() - started
-            pending_retry.append({
-                "index": index,
-                "path": input_path,
-                "first_error": _short_error(exc),
-                "traceback": traceback.format_exc(),
-            })
-            event_queue.put(("retry_queued", index, _short_error(exc), elapsed))
-
-        event_queue.put(("attempt_complete", elapsed))
-
-    if pending_retry and not stop_event.is_set():
-        event_queue.put(("retry_begin", len(pending_retry)))
-
-        for item in pending_retry:
-            if stop_event.is_set():
-                break
-
-            index = item["index"]
-            input_path = item["path"]
-            neighbour_alignments = _nearest_success_alignments(
-                success_records,
-                failed_index=index,
-                limit=HISTORY_LENGTH,
-            )
-            priors = build_alignment_priors(
-                neighbour_alignments,
-                max_samples=HISTORY_LENGTH,
-            )
-
-            if not priors:
-                event_queue.put((
-                    "final_error",
-                    index,
-                    "No successful neighbouring alignment was available for a history-guided retry.",
-                    0.0,
-                ))
-                continue
-
-            event_queue.put(("file_start", index, input_path.name, "retry"))
-            started = time.perf_counter()
-
-            def retry_status(stage):
-                event_queue.put(("stage", index, stage, "retry"))
-
-            try:
-                result = process_single_file(
-                    input_path,
-                    alignment_priors=priors,
-                    reuse_split=True,
-                    status_callback=retry_status,
-                )
-                elapsed = time.perf_counter() - started
-                success_records[index] = result
-                event_queue.put(("success", index, result, elapsed, True))
-            except Exception as exc:
-                elapsed = time.perf_counter() - started
-                combined_error = (
-                    f"First pass: {item['first_error']} | "
-                    f"History-guided retry: {_short_error(exc)}"
-                )
-                event_queue.put(("final_error", index, combined_error, elapsed))
-
-            event_queue.put(("attempt_complete", elapsed))
-
-    resolved = set(success_records)
-    failed_indices = [i for i in range(total) if i not in resolved]
-
-    if stop_event.is_set():
-        event_queue.put(("cancelled", success_records, failed_indices))
-    else:
-        event_queue.put(("done", success_records, failed_indices))
+    try:
+        run_pipeline(file_paths, event_queue.put, stop_event, settings)
+    except Exception:
+        event_queue.put(("crash", traceback.format_exc()))
 
 
 class PipelineWindow:
@@ -287,10 +55,12 @@ class PipelineWindow:
     TEXT = "#111111"
     MUTED = "#555555"
 
-    def __init__(self, root: tk.Tk, file_paths):
+    def __init__(self, root: tk.Tk, file_paths, settings):
         self.root = root
-        self.file_paths = list(file_paths)
+        self.settings = settings
+        self.file_paths = sort_paths(file_paths)
         self.total = len(self.file_paths)
+        self.batch_mode = use_batch_mode(self.total, settings)
 
         self.events = queue.Queue()
         self.stop_event = threading.Event()
@@ -319,7 +89,7 @@ class PipelineWindow:
 
         worker = threading.Thread(
             target=_worker,
-            args=(self.file_paths, self.events, self.stop_event),
+            args=(self.file_paths, self.events, self.stop_event, self.settings),
             daemon=True,
         )
         worker.start()
@@ -351,7 +121,10 @@ class PipelineWindow:
 
         self.operation_label = ttk.Label(
             outer,
-            text=f"Processing {self.total} multispectral image{'s' if self.total != 1 else ''}",
+            text=(
+                f"Processing {self.total} multispectral image{'s' if self.total != 1 else ''}"
+                + (" · batch consensus mode" if self.batch_mode else "")
+            ),
             font=("Segoe UI", 11),
             style="Main.TLabel",
         )
@@ -623,6 +396,9 @@ class PipelineWindow:
                     status="Retrying",
                     details="Using successful neighbouring images",
                 )
+            elif phase == "calibration":
+                self.current_stage = "Calibration: full alignment"
+                self._set_tree(index, status="Calibrating", details="")
             else:
                 self.current_stage = "Starting image"
                 self._set_tree(index, status="Processing", details="")
@@ -631,7 +407,7 @@ class PipelineWindow:
 
         elif kind == "stage":
             _, index, stage, phase = event
-            prefix = "Retry: " if phase == "retry" else ""
+            prefix = {"retry": "Retry: ", "calibration": "Calibration: "}.get(phase, "")
             self.current_stage = prefix + stage
             self.stage_label.configure(text=self.current_stage)
             self._set_tree(index, details=self.current_stage)
@@ -645,11 +421,15 @@ class PipelineWindow:
             note_parts = [f"Quality: {quality}", f"{elapsed:.1f} s"]
             if recovered:
                 note_parts.insert(0, "Recovered on second pass")
+            elif result.get("batch_consensus_used"):
+                note_parts.insert(0, "Batch geometry (verified)")
             elif history_used:
                 note_parts.insert(0, "Recovered with historical lens prior")
 
             if copy_ok:
-                note_parts.append("TIFF saved in both locations")
+                note_parts.append(
+                    "TIFF saved in both locations" if result.get("tiff_collection_copy") else "TIFF saved"
+                )
                 status_text = "Success"
             else:
                 note_parts.append(
@@ -689,6 +469,17 @@ class PipelineWindow:
         elif kind == "attempt_complete":
             _, elapsed = event
             self._record_attempt_duration(float(elapsed))
+
+        elif kind in {"mode", "phase"}:
+            _, text = event
+            self.current_stage = text
+            self.stage_label.configure(text=text)
+
+        elif kind == "crash":
+            _, tb = event
+            self.running = False
+            messagebox.showerror("Processing stopped", tb[-1500:], parent=self.root)
+            self.cancel_button.configure(text="Close", command=self.root.destroy, state="normal")
 
         elif kind == "retry_begin":
             _, total = event
@@ -755,22 +546,86 @@ class PipelineWindow:
         self.stage_label.configure(text="Stopping after the current image...")
 
 
+def _choose_inputs(root: tk.Tk):
+    """Small launcher: choose individual images or a whole folder."""
+    choice = {"value": None}
+
+    dialog = tk.Toplevel(root)
+    dialog.title("Automated Multispectral Alignment")
+    dialog.resizable(False, False)
+    frame = ttk.Frame(dialog, padding=24)
+    frame.pack(fill="both", expand=True)
+
+    ttk.Label(frame, text="What would you like to process?", font=("Segoe UI", 11)).pack(
+        anchor="w", pady=(0, 12)
+    )
+
+    def pick(value):
+        choice["value"] = value
+        dialog.destroy()
+
+    ttk.Button(frame, text="Select images...", width=28, command=lambda: pick("files")).pack(
+        fill="x", pady=3
+    )
+    ttk.Button(frame, text="Select a whole folder...", width=28, command=lambda: pick("folder")).pack(
+        fill="x", pady=3
+    )
+    ttk.Label(
+        frame,
+        text="In a folder with both RAW and JPG of the same shot, only the RAW is used.",
+        font=("Segoe UI", 8),
+        wraplength=260,
+    ).pack(anchor="w", pady=(10, 0))
+
+    dialog.protocol("WM_DELETE_WINDOW", lambda: pick(None))
+    dialog.update_idletasks()
+    x = (dialog.winfo_screenwidth() - dialog.winfo_width()) // 2
+    y = (dialog.winfo_screenheight() - dialog.winfo_height()) // 3
+    dialog.geometry(f"+{x}+{y}")
+    dialog.grab_set()
+    root.wait_window(dialog)
+
+    if choice["value"] == "files":
+        return list(filedialog.askopenfilenames(
+            parent=root,
+            title="Select one or more compound multispectral images",
+            filetypes=file_dialog_types(),
+        ))
+
+    if choice["value"] == "folder":
+        folder = filedialog.askdirectory(parent=root, title="Select a folder of compound images")
+        if not folder:
+            return []
+        files = collect_folder_images(folder)
+        if not files:
+            messagebox.showinfo(
+                "No images found",
+                "The selected folder contains no supported images.",
+                parent=root,
+            )
+        return files
+
+    return []
+
+
 def main():
     root = tk.Tk()
     root.withdraw()
 
-    file_paths = filedialog.askopenfilenames(
-        parent=root,
-        title="Select one or more compound multispectral images",
-        filetypes=file_dialog_types(),
-    )
+    try:
+        settings = load_settings()
+    except Exception as exc:
+        messagebox.showerror("Configuration error", str(exc), parent=root)
+        root.destroy()
+        return
 
+    file_paths = _choose_inputs(root)
     if not file_paths:
         root.destroy()
         return
 
     root.deiconify()
-    PipelineWindow(root, file_paths)
+    PipelineWindow(root, file_paths, settings)
     root.mainloop()
 
 

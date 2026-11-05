@@ -23,24 +23,13 @@ import tifffile
 
 from alignment_core import estimate_xy_v4, DEFAULT_CONFIG
 from image_io import find_split_set
+from settings import DEFAULT_SETTINGS, file_bands_int
 from alignment_plan_b import estimate_xy_plan_b
 
 
-FILE_BANDS = {
-    1: ("0",   "0",   "850"),
-    2: ("0",   "525", "630"),
-    3: ("405", "570", "710"),
-    4: ("430", "550", "650"),
-    5: ("450", "560", "685"),
-    6: ("490", "0",   "735"),
-}
-
-OUTPUT_ORDER = [
-    "405", "430", "450", "490",
-    "525", "550", "560", "570",
-    "630", "650", "685", "710",
-    "735", "850",
-]
+# Defaults; the pipeline passes the values from settings (pipeline_config.json).
+FILE_BANDS = file_bands_int(DEFAULT_SETTINGS)
+OUTPUT_ORDER = list(DEFAULT_SETTINGS["output_order"])
 
 # Stable pair geometry used by the 2/5-centered fallback layout.
 # Historical priors are kept separately for every physical lens pair.
@@ -352,10 +341,14 @@ def estimate_alignment_from_split(
     completely to the 2/5-centered fallback layout.  Normal fallback methods are
     always attempted before historical priors are allowed to influence a pair.
     """
+    images = load_split_images(split_dir, split_ext)
+    return estimate_alignment_from_images(images, config=config, alignment_priors=alignment_priors)
+
+
+def estimate_alignment_from_images(images, config=None, alignment_priors=None):
+    """Same as estimate_alignment_from_split, for lens images already in memory."""
     if config is None:
         config = DEFAULT_CONFIG.copy()
-
-    images = load_split_images(split_dir, split_ext)
 
     try:
         print("Trying primary alignment...")
@@ -378,11 +371,11 @@ def estimate_alignment_from_split(
         )
 
 
-def build_band_map():
+def build_band_map(file_bands=None):
     band_map = {}
     rgb_to_bgr = {0: 2, 1: 1, 2: 0}
 
-    for file_id, labels in FILE_BANDS.items():
+    for file_id, labels in (file_bands or FILE_BANDS).items():
         for rgb_pos, band_name in enumerate(labels):
             if band_name == "0":
                 continue
@@ -407,6 +400,16 @@ def classify_alignment_quality(pair_result):
         if support >= 6:
             return "medium"
         return "low"
+
+    if algorithm == "batch_consensus_verified":
+        details = pair_result.get("details", {}) or {}
+        residual_mag = float(np.hypot(
+            details.get("residual_dx", 0),
+            details.get("residual_dy", 0),
+        ))
+        if residual_mag <= 1.5:
+            return "high"
+        return "medium"
 
     if algorithm == "history_prior_cross_method_consensus":
         details = pair_result.get("details", {}) or {}
@@ -484,9 +487,25 @@ def write_alignment_quality_report(output_tiff: Path, export_result):
         f"Overall quality: {summary['overall_quality']}",
         f"Mean confidence: {summary['mean_confidence']:.4f}",
         f"Minimum support: {summary['min_support']}",
-        "",
-        "Per-pair results:",
     ]
+
+    split_info = export_result.get("split_info") or {}
+    if split_info:
+        lines.append(
+            f"Source size: {split_info.get('source_width')}x{split_info.get('source_height')} "
+            f"(expected {split_info.get('expected_width')}x{split_info.get('expected_height')}), "
+            f"split mode: {split_info.get('split_mode')}"
+        )
+
+    batch = alignment.get("batch_consensus")
+    if batch:
+        lines.append(
+            f"Batch consensus: learned from {batch.get('agreeing')}/{batch.get('successful')} "
+            f"calibration images (tolerance {batch.get('tolerance_px')} px); "
+            "shift verified on this image before use"
+        )
+
+    lines += ["", "Per-pair results:"]
 
     for row in summary["rows"]:
         history_note = ""
@@ -526,24 +545,68 @@ def export_multipage_tiff_from_split(
     alignment_priors=None,
     status_callback=None,
     split_ext=None,
+    images=None,
+    file_bands=None,
+    output_order=None,
+    split_info=None,
 ):
+    """Align the six lens images and export the multiband TIFF.
+
+    `images` may be passed to skip reading the split images from split_dir.
+    """
+    if images is None:
+        images = load_split_images(split_dir, split_ext)
+
     if status_callback:
         status_callback("Aligning lens images")
 
-    alignment_result = estimate_alignment_from_split(
-        split_dir,
+    alignment_result = estimate_alignment_from_images(
+        images,
         config=config,
         alignment_priors=alignment_priors,
-        split_ext=split_ext,
     )
+
+    return export_aligned_tiff(
+        images,
+        alignment_result,
+        output_tiff,
+        status_callback=status_callback,
+        file_bands=file_bands,
+        output_order=output_order,
+        split_info=split_info,
+    )
+
+
+def apply_translation(img, dx, dy):
+    """Integer translation; uncovered pixels become 0."""
+    h, w = img.shape[:2]
+    M = np.float32([[1, 0, float(dx)], [0, 1, float(dy)]])
+    return cv2.warpAffine(
+        img,
+        M,
+        (w, h),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
+
+
+def export_aligned_tiff(
+    images,
+    alignment_result,
+    output_tiff: Path,
+    status_callback=None,
+    file_bands=None,
+    output_order=None,
+    split_info=None,
+):
+    """Apply alignment_result['apply_shifts'], crop the common area and write the TIFF."""
     apply_shifts = alignment_result["apply_shifts"]
 
     print(f"Alignment mode: {alignment_result['mode']}")
     print("Apply shifts:")
     for idx in sorted(apply_shifts.keys()):
         print(f"  {idx}: dx={apply_shifts[idx]['dx']}, dy={apply_shifts[idx]['dy']}")
-
-    images = load_split_images(split_dir, split_ext)
 
     ref_h, ref_w = images[1].shape[:2]
     for idx, img in images.items():
@@ -552,44 +615,24 @@ def export_multipage_tiff_from_split(
             raise ValueError(f"Image size mismatch in split set: image {idx}")
 
     warped = {}
-    masks = {}
+    common = np.full((ref_h, ref_w), 255, dtype=np.uint8)
 
     for idx, img in images.items():
         dx = int(apply_shifts[idx]["dx"])
         dy = int(apply_shifts[idx]["dy"])
+        warped[idx] = apply_translation(img, dx, dy)
 
-        M = cv2.getRotationMatrix2D((0, 0), 0, 1.0)
-        M[0, 2] = dx
-        M[1, 2] = dy
-
-        warped_img = cv2.warpAffine(
-            img,
-            M,
-            (ref_w, ref_h),
-            flags=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=0,
-        )
-
-        mask = 255 * (cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) >= 0).astype("uint8")
-        warped_mask = cv2.warpAffine(
-            mask,
-            M,
+        # Valid area = where the shifted lens image actually has data.
+        frame = np.full((ref_h, ref_w), 255, dtype=np.uint8)
+        valid = cv2.warpAffine(
+            frame,
+            np.float32([[1, 0, dx], [0, 1, dy]]),
             (ref_w, ref_h),
             flags=cv2.INTER_NEAREST,
             borderMode=cv2.BORDER_CONSTANT,
             borderValue=0,
         )
-
-        warped[idx] = warped_img
-        masks[idx] = warped_mask
-
-    common = None
-    for idx in range(1, 7):
-        if common is None:
-            common = masks[idx].copy()
-        else:
-            common = cv2.bitwise_and(common, masks[idx])
+        common = cv2.bitwise_and(common, valid)
 
     ys, xs = (common > 0).nonzero()
     if len(xs) == 0 or len(ys) == 0:
@@ -598,14 +641,14 @@ def export_multipage_tiff_from_split(
     x0, x1 = int(xs.min()), int(xs.max()) + 1
     y0, y1 = int(ys.min()), int(ys.max()) + 1
 
-    band_map = build_band_map()
+    band_map = build_band_map(file_bands)
     output_tiff.parent.mkdir(parents=True, exist_ok=True)
 
     if status_callback:
-        status_callback("Writing aligned 14-band TIFF")
+        status_callback("Writing aligned multiband TIFF")
 
     with tifffile.TiffWriter(str(output_tiff)) as tif:
-        for band_name in OUTPUT_ORDER:
+        for band_name in (output_order or OUTPUT_ORDER):
             file_id, ch_idx = band_map[band_name]
             band = warped[file_id][y0:y1, x0:x1, ch_idx]
 
@@ -621,6 +664,7 @@ def export_multipage_tiff_from_split(
         "crop_box": {"x0": x0, "y0": y0, "x1": x1, "y1": y1},
         "final_size": {"width": x1 - x0, "height": y1 - y0},
         "output_tiff": str(output_tiff),
+        "split_info": split_info or {},
     }
 
     if status_callback:

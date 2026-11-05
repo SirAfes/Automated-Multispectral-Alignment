@@ -105,6 +105,21 @@ Images that still fail are retried after the first pass. For this second pass, t
 
 If no successful neighbours exist, or if the historical retry is still unsupported, the image remains failed.
 
+## Batch consensus mode
+
+For selections of `batch_threshold` (default 50) or more images, the pipeline assumes the images were taken with the same camera at roughly the same distance. The lens-to-lens displacement is then fixed physical geometry plus a distance-dependent parallax term that is nearly constant across the batch.
+
+1. **Calibration.** `batch_calibration_samples` (default 16) images, evenly spaced over the whole batch (first and last included), are aligned with the full per-image method described above.
+2. **Consensus.** All shifts are expressed relative to lens 1 (so primary and Plan B results are comparable). The per-lens median is computed, and a calibration image *agrees* if every lens lies within `batch_consensus_tolerance_px` (default 3 px) of it. The consensus is the median of the agreeing images. It is used only if at least `batch_min_successful_samples` images succeeded and at least `batch_min_agreement` (default 75 %) of them agree. A wrongly accepted single result is therefore excluded rather than averaged in. If the batch does not agree — typically because it mixes distances — every remaining image is aligned individually, exactly as in normal mode.
+3. **Per-image verification and refinement.** For every other image, the gradient-magnitude centre of lens 1 is searched for in each lens image by normalised cross-correlation, but only within `batch_verify_max_residual_px` + 4 px of the consensus position (at half resolution, with parabolic sub-pixel peak refinement). The bounded search cannot lock onto an unrelated match elsewhere in the image, and a peak on the edge of the window means the true shift lies outside it.
+   - The image is accepted when every lens has its peak inside the window, a residual ≤ `batch_verify_max_residual_px` (default 5 px) and a correlation of at least `batch_verify_min_response_ratio` × the median correlation measured on the calibration images at their own known-good shifts. This threshold is learned from the data, so it adapts to how similar the spectral bands of each lens pair are.
+   - The final shift is the consensus shift plus the measured residual (rounded). The consensus is the anchor; the residual follows small frame-to-frame differences.
+   - If the check fails, the image gets the full per-image alignment, with the consensus calibration images as history priors. It is never forced onto the consensus.
+
+Quality reports of consensus images record the consensus, the residual and the number of agreeing calibration images. Their quality is `high` for a residual ≤ 1.5 px and `medium` otherwise.
+
+The cost per consensus image is dominated by reading the file and writing the TIFF; the alignment search itself is skipped. Split lens images are not written for consensus images unless `batch_keep_split_images` is enabled.
+
 ## Geometric model
 
 The exported product currently uses global translational displacement (`dx`, `dy`) for each lens image. The pipeline does not apply dense optical flow, local mesh deformation or non-rigid warping.
@@ -131,5 +146,7 @@ Final order:
 The quality report records pair-level method, algorithm, raw and applied translation, support and confidence/score values.
 
 History-guided pairs additionally report the number of prior samples and the measured residual correction. Confidence values from different algorithms are evidence scores from different procedures and should not be interpreted as directly comparable statistical probabilities.
+
+Each report also records the source image size and the split mode. `proportional` means the source size differed from the expected grid (for example a RAW decoder adding border pixels); cells are then cut from the centre at native resolution. `proportional_resized` means the cells were smaller than expected and had to be resized — check such images.
 
 For scientific use, inspect low/medium-quality results and a representative subset of high-quality results visually before downstream quantitative analysis.

@@ -274,6 +274,16 @@ def preprocess_for_features(img):
     return g
 
 
+def _create_akaze():
+    """AKAZE detector; OpenCV 5 moved it out of the main module."""
+    if hasattr(cv2, "AKAZE_create"):
+        return cv2.AKAZE_create()
+    legacy = getattr(cv2, "xfeatures2d_AKAZE", None)
+    if legacy is not None and hasattr(legacy, "create"):
+        return legacy.create()
+    return None
+
+
 def feature_ransac_translation(ref_img, mov_img, config=None):
     """
     Estimate translation using AKAZE feature matching + RANSAC-like filtering.
@@ -284,7 +294,9 @@ def feature_ransac_translation(ref_img, mov_img, config=None):
     ref_g = preprocess_for_features(ref_img)
     mov_g = preprocess_for_features(mov_img)
 
-    detector = cv2.AKAZE_create()
+    detector = _create_akaze()
+    if detector is None:
+        return None
     kp1, des1 = detector.detectAndCompute(ref_g, None)
     kp2, des2 = detector.detectAndCompute(mov_g, None)
 

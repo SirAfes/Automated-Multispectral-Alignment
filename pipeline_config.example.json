@@ -1,0 +1,23 @@
+{
+  "_comment": "Copy this file to pipeline_config.json (next to the .exe, or in the repository root) and keep only the settings you want to change. Defaults are in src/settings.py.",
+
+  "cell_size": 3168,
+  "center_crop_frac": 0.80,
+
+  "file_bands": {
+    "1": ["0", "0", "850"],
+    "2": ["0", "525", "630"],
+    "3": ["405", "570", "710"],
+    "4": ["430", "550", "650"],
+    "5": ["450", "560", "685"],
+    "6": ["490", "0", "735"]
+  },
+
+  "collection_mode": "hardlink",
+
+  "batch_threshold": 50,
+  "batch_calibration_samples": 16,
+  "batch_consensus_tolerance_px": 3.0,
+  "batch_verify_max_residual_px": 5.0,
+  "batch_keep_split_images": false
+}

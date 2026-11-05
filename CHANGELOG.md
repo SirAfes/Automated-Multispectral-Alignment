@@ -4,6 +4,11 @@
 
 ### Added
 
+- Batch consensus mode for 50+ images: a calibration sample learns the common lens geometry, which is verified (bounded local NCC search) and refined on every other image; unconfirmed images get the full alignment.
+- "Select a whole folder" option; RAW is preferred when a folder holds RAW and JPG of the same shot.
+- `pipeline_config.json` settings file (camera layout, band mapping, batch and output options) with validation.
+- Automated tests with synthetic images and a GitHub Actions test workflow (Windows and Linux).
+
 - Camera RAW input (`.arw`, `.raw` and other LibRaw formats) via rawpy, decoded linearly without white balance or colour matrix; RAW inputs keep 16-bit data through 16-bit TIFF split images and a 16-bit final TIFF.
 - File dialog filters for all supported, RAW-only and standard image types.
 
@@ -16,6 +21,13 @@
 - History/prior information in alignment quality reports.
 
 ### Improved
+
+- Images are processed in natural file-name order, so neighbour-based history uses true neighbours.
+- Shared `tiff/` collection uses hard links by default (no extra disk space).
+- Sources slightly larger than the expected grid are cut at native resolution instead of being resampled; the split mode is recorded in the quality report.
+- Valid-area mask after shifting is computed explicitly (the previous `>= 0` test was always true).
+- AKAZE is found on OpenCV 5 builds as well.
+- Processing logic moved from the GUI into `pipeline_core.py`.
 
 - Non-ASCII file paths (e.g. Turkish characters) are now read and written correctly on Windows.
 - AKAZE fallback scales 16-bit images to 8-bit instead of truncating them.
