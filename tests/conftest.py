@@ -51,7 +51,10 @@ def make_compound(seed, shifts=SHIFTS, cell=CELL, jitter=0):
 
 
 def write_jpg(path, img):
-    cv2.imwrite(str(path), (img * 255).astype(np.uint8))
+    # imencode + tofile: cv2.imwrite cannot write non-ASCII paths on Windows.
+    ok, buf = cv2.imencode(".jpg", (img * 255).astype(np.uint8))
+    assert ok
+    buf.tofile(str(path))
     return path
 
 
