@@ -33,11 +33,11 @@ The reference configuration is a 3 × 2 six-lens camera with 14 bands from 405 t
 
 ### Windows — no Python required
 
-1. Open the **Actions** tab of this repository and choose **Build Windows executable**.
-2. Open the latest successful run and download **Automated-Multispectral-Alignment-Windows** under *Artifacts*.
+1. Open the [latest release](https://github.com/SirAfes/Automated-Multispectral-Alignment/releases/latest).
+2. Download `Automated_Multispectral_Alignment-<version>-windows.zip`.
 3. Extract the ZIP and run `Automated_Multispectral_Alignment.exe`.
 
-> Windows may warn about an unsigned executable downloaded from the internet. The artifact is built by GitHub Actions directly from the source in this repository.
+> Windows may warn about an unsigned executable downloaded from the internet. Release files are built by GitHub Actions directly from the tagged source in this repository.
 
 ### Python (Windows, macOS, Linux)
 
@@ -46,6 +46,8 @@ Python 3.10 or newer:
 ```bash
 python -m pip install "git+https://github.com/SirAfes/Automated-Multispectral-Alignment.git"
 ```
+
+(or install the `.whl` file attached to a [release](https://github.com/SirAfes/Automated-Multispectral-Alignment/releases)).
 
 This installs two commands: `msalign` (command line) and `msalign-gui` (desktop app).
 
