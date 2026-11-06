@@ -1,0 +1,49 @@
+{
+  "_comment": "Copy to pipeline_config.json (next to the .exe, or pass it with --config) and keep only the settings you change. All settings and defaults: src/msalign/settings.py, or run: msalign --list-settings",
+
+  "grid_cols": 3,
+  "grid_rows": 2,
+  "cell_size": 3168,
+  "center_crop_frac": 0.80,
+
+  "file_bands": {
+    "1": {"R": "850"},
+    "2": {"R": "630", "G": "525"},
+    "3": {"R": "710", "G": "570", "B": "405"},
+    "4": {"R": "650", "G": "550", "B": "430"},
+    "5": {"R": "735", "B": "490"},
+    "6": {"R": "685", "G": "560", "B": "450"}
+  },
+  "output_order": ["405", "430", "450", "490", "525", "550", "560", "570",
+                   "630", "650", "685", "710", "735", "850"],
+
+  "camera": {
+    "make": null,
+    "model": null,
+    "lens": "Agrowing Sextuple",
+    "focal_length_mm": 21.8,
+    "pixel_size_um": 3.76,
+    "band_fwhm_nm": 30
+  },
+
+  "output_size_px": [2048, 2048],
+  "output_anchor": "common_area_center",
+  "tiff_layout": "multiband",
+  "tiff_compression": "none",
+
+  "raw_demosaic": "linear",
+  "local_residual_check": true,
+  "parallax_correction": false,
+
+  "parallax_range_px": [20, 360],
+
+  "closure_check": "reject",
+  "closure_tolerance_px": 4.0,
+
+  "collection_mode": "hardlink",
+
+  "batch_threshold": 50,
+  "batch_calibration_samples": 16,
+  "batch_verify_max_residual_px": 5.0,
+  "batch_keep_split_images": false
+}

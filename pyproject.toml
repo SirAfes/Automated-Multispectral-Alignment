@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "automated-multispectral-alignment"
+dynamic = ["version"]
+description = "Automated registration of multi-lens (snapshot) multispectral images into aligned multiband TIFFs"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "Ahmet F. Semerci" }]
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=2.0,<3",
+    "opencv-python>=4.10,<5",
+    "tifffile>=2025.1",
+    "rawpy>=0.24",
+]
+keywords = ["multispectral", "image registration", "remote sensing", "spectral imaging", "camera RAW"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Image Processing",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pillow>=10"]
+
+[project.scripts]
+msalign = "msalign.cli:main"
+
+[project.gui-scripts]
+msalign-gui = "msalign.gui:main"
+
+[project.urls]
+Homepage = "https://github.com/SirAfes/Automated-Multispectral-Alignment"
+Issues = "https://github.com/SirAfes/Automated-Multispectral-Alignment/issues"
+
+[tool.setuptools.dynamic]
+version = { attr = "msalign.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

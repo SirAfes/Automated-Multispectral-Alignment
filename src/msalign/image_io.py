@@ -64,7 +64,39 @@ def file_dialog_types():
     ]
 
 
-def _read_raw(path: Path):
+RAW_DEMOSAIC = ("linear", "ahd")
+
+
+def raw_decode_params(demosaic: str = "linear") -> dict:
+    """
+    LibRaw parameters, chosen to keep the sensor channels separate and the
+    scaling identical for every image:
+
+    - no white balance, no colour matrix, linear response, no auto brightening;
+    - demosaic "linear": bilinear interpolation from same-colour neighbours
+      only. Correlation-based methods such as AHD (the LibRaw default) use the
+      other channels to interpolate, which moves noise and structure between
+      spectral bands (Eskelinen & Hamalainen, WHISPERS 2018);
+    - adjust_maximum_thr = 0: LibRaw otherwise lowers the white level per image
+      from the image content, which changes the digital scaling between
+      images.
+    """
+    if demosaic not in RAW_DEMOSAIC:
+        raise ValueError(f"raw_demosaic must be one of {RAW_DEMOSAIC}")
+    return {
+        "use_camera_wb": False,
+        "use_auto_wb": False,
+        "user_wb": [1.0, 1.0, 1.0, 1.0],
+        "output_color": "raw",
+        "gamma": (1, 1),
+        "no_auto_bright": True,
+        "output_bps": 16,
+        "demosaic": demosaic,
+        "adjust_maximum_thr": 0.0,
+    }
+
+
+def _read_raw(path: Path, demosaic: str = "linear"):
     try:
         import rawpy
     except ImportError as exc:
@@ -73,17 +105,15 @@ def _read_raw(path: Path):
             "(pip install rawpy)."
         ) from exc
 
+    params = raw_decode_params(demosaic)
+    algorithm = {
+        "linear": rawpy.DemosaicAlgorithm.LINEAR,
+        "ahd": rawpy.DemosaicAlgorithm.AHD,
+    }[params.pop("demosaic")]
+    params["output_color"] = rawpy.ColorSpace.raw
     try:
         with rawpy.imread(str(path)) as raw:
-            rgb = raw.postprocess(
-                use_camera_wb=False,
-                use_auto_wb=False,
-                user_wb=[1.0, 1.0, 1.0, 1.0],
-                output_color=rawpy.ColorSpace.raw,
-                gamma=(1, 1),
-                no_auto_bright=True,
-                output_bps=16,
-            )
+            rgb = raw.postprocess(demosaic_algorithm=algorithm, **params)
     except Exception as exc:
         raise IOError(f"Could not decode RAW file {path.name}: {exc}") from exc
 
@@ -91,14 +121,14 @@ def _read_raw(path: Path):
     return np.ascontiguousarray(rgb[:, :, ::-1])
 
 
-def read_image(path):
+def read_image(path, raw_demosaic: str = "linear"):
     """Read a standard or RAW image. Returns a BGR (or grayscale) numpy array."""
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"Input image not found: {path}")
 
     if is_raw_file(path):
-        return _read_raw(path)
+        return _read_raw(path, raw_demosaic)
 
     # np.fromfile + imdecode also handles non-ASCII Windows paths,
     # which cv2.imread cannot open.
@@ -109,16 +139,16 @@ def read_image(path):
     return img
 
 
-def find_split_set(split_dir: Path, preferred_ext: str | None = None):
+def find_split_set(split_dir: Path, preferred_ext: str | None = None, count: int = 6):
     """
-    Return the extension of a complete 1..6 split set in split_dir, or None.
+    Return the extension of a complete 1..count split set in split_dir, or None.
 
     If preferred_ext is given, only that extension is accepted, so a RAW input
     never silently reuses JPG splits from the camera's JPG twin (or vice versa).
     """
     candidates = (preferred_ext,) if preferred_ext else SPLIT_EXTENSIONS
     for ext in candidates:
-        if all((split_dir / f"{idx}{ext}").is_file() for idx in range(1, 7)):
+        if all((split_dir / f"{idx}{ext}").is_file() for idx in range(1, count + 1)):
             return ext
     return None
 
@@ -128,6 +158,17 @@ def to_uint8(img):
     if img.dtype == np.uint8:
         return img
     g = img.astype(np.float32)
-    lo, hi = np.percentile(g, 0.5), np.percentile(g, 99.5)
+    lo, hi = fast_percentiles(g, [0.5, 99.5])
     g = (g - lo) * (255.0 / max(hi - lo, 1e-6))
     return np.clip(g, 0, 255).astype(np.uint8)
+
+
+def fast_percentiles(arr, q, max_samples=1_000_000):
+    """
+    Percentiles from a regular pixel subsample (at most ~max_samples values).
+    For intensity statistics of photographs this is indistinguishable from
+    the full computation and an order of magnitude faster on 6 MP images.
+    """
+    flat = np.asarray(arr).reshape(-1)
+    step = max(1, flat.size // max_samples)
+    return np.percentile(flat[::step], q)

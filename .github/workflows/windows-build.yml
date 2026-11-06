@@ -8,6 +8,7 @@ on:
       - 'src/**'
       - 'requirements*.txt'
       - 'build/**'
+      - 'pyproject.toml'
       - '.github/workflows/windows-build.yml'
 
 jobs:
@@ -48,4 +49,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: Automated-Multispectral-Alignment-Windows
-          path: build-output/Automated_Multispectral_Alignment.exe
+          path: |
+            build-output/Automated_Multispectral_Alignment.exe
+            pipeline_config.example.json

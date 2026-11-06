@@ -1,211 +1,257 @@
 # Automated Multispectral Alignment
 
-**Automated Multispectral Alignment** is a desktop image-processing pipeline for multi-lens multispectral imagery. It takes a compound multispectral photograph, separates it into six lens images, automatically aligns the lens views, extracts the configured spectral bands, and exports a spatially aligned 14-band TIFF.
+[![Tests](https://github.com/SirAfes/Automated-Multispectral-Alignment/actions/workflows/tests.yml/badge.svg)](https://github.com/SirAfes/Automated-Multispectral-Alignment/actions/workflows/tests.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-The software is intended for researchers and imaging users, including users who do not normally work with Python or software development.
+**msalign** registers the lens images of **multi-lens (snapshot) multispectral cameras** and exports a spatially aligned multiband TIFF — automatically, without manual control points.
 
-## What it does
-
-```text
-Compound multispectral image
-            ↓
-    Split into 6 lens images
-            ↓
- Automatic inter-lens alignment
-            ↓
-   Alignment quality assessment
-            ↓
-   Extract 14 spectral bands
-            ↓
-  Determine common valid region
-            ↓
-    Aligned 14-band TIFF
-```
-
-No manual control-point selection is required during normal processing.
-
-## Windows — no Python required
-
-The easiest way to use the project on Windows is the standalone executable built by GitHub Actions.
-
-1. Open the **Actions** tab at the top of this repository.
-2. Select **Build Windows executable**.
-3. Open the latest successful run marked with a green check.
-4. Scroll to **Artifacts**.
-5. Download **Automated-Multispectral-Alignment-Windows**.
-6. Extract the downloaded ZIP file.
-7. Run `Automated_Multispectral_Alignment.exe`.
-
-The application opens a standard file-selection window. Select one or more compound multispectral images and processing begins automatically.
-
-> Windows may display a security warning for an unsigned executable downloaded from the internet. The Actions artifact is built directly from the source code in this repository.
-
-## Desktop processing window
-
-The Windows application uses a graphical progress window rather than a command prompt. During processing it shows:
-
-- the image currently being processed;
-- the current processing stage;
-- overall progress;
-- an estimated remaining time based on completed images;
-- live counts for successful, pending-retry and failed images;
-- an expandable **Details** section showing the status of every selected image.
-
-## How a batch is processed
-
-The first pass processes the selected images sequentially. Each image is split, aligned and exported before the next image begins.
-
-If an image cannot be aligned reliably, it is **not immediately accepted with a looser threshold**. It is marked for a second-pass retry. Successful neighbouring images are then used to estimate the stable physical displacement between lens pairs, and the unresolved image is tried again around that expected geometry.
-
-This gives the pipeline two useful sources of evidence:
+A multi-lens camera records one compound photograph in which every lens, each behind its own filter, sees the scene from a slightly different position. Before the bands can be used together, the lens views must be split and brought onto one pixel grid. msalign does this for single photographs and for series of thousands, and it says how much each result can be trusted.
 
 ```text
-Image evidence from the current photograph
-                  +
-Lens geometry learned from successful neighbouring photographs
+Compound image (JPG / TIFF / camera RAW)
+        ↓  split into lens images
+        ↓  register lenses to each other (multi-stage, with fallbacks)
+        ↓  closure check: independent test of every shift
+        ↓  crop to the area all lenses share
+Aligned multiband TIFF  +  quality report (TXT / CSV)
 ```
 
-If the second pass is still not sufficiently supported, the image remains an error for manual inspection rather than being forced into the final dataset.
+The reference configuration is a 3 × 2 six-lens camera with 14 bands from 405 to 850 nm. Any rectangular lens array (2 × 2, 4 × 4, 1 × 5, …) and any band mapping can be set up in a [settings file](#configuration).
 
-## Output
+## Contents
 
-For an input such as `DSC06664.JPG`, the software creates a dedicated output folder:
+- [Installation](#installation)
+- [Usage](#usage)
+- [Outputs](#outputs) · [Metadata](#metadata)
+- [Configuration](#configuration)
+- [How it works](#how-it-works)
+- [Validation and responsible use](#validation-and-responsible-use)
+- [Development](#development)
+- [Citation](#citation) · [License](#license)
+
+## Installation
+
+### Windows — no Python required
+
+1. Open the **Actions** tab of this repository and choose **Build Windows executable**.
+2. Open the latest successful run and download **Automated-Multispectral-Alignment-Windows** under *Artifacts*.
+3. Extract the ZIP and run `Automated_Multispectral_Alignment.exe`.
+
+> Windows may warn about an unsigned executable downloaded from the internet. The artifact is built by GitHub Actions directly from the source in this repository.
+
+### Python (Windows, macOS, Linux)
+
+Python 3.10 or newer:
+
+```bash
+python -m pip install "git+https://github.com/SirAfes/Automated-Multispectral-Alignment.git"
+```
+
+This installs two commands: `msalign` (command line) and `msalign-gui` (desktop app).
+
+## Usage
+
+### Desktop app
+
+Start the `.exe` or `msalign-gui`. Choose **Select images…** or **Select a whole folder…**; processing starts at once. The window shows progress, remaining time and a per-image status list.
+
+When a folder holds both the RAW and the JPG of a shot, only the RAW is used. Subfolders (for example earlier outputs) are not scanned.
+
+### Command line
+
+```bash
+msalign D:/survey/day1                         # every image in the folder
+msalign IMG_0001.ARW IMG_0002.ARW              # selected files
+msalign D:/survey/day1 --set closure_check=warn
+msalign D:/survey/day1 --config my_camera.json
+msalign --list-settings                        # show all settings and current values
+```
+
+`msalign --help` lists all options. The exit code is 0 when every image succeeded and 1 otherwise, so the command fits into scripts.
+
+### Large series
+
+From 50 images on, msalign uses **batch consensus mode** for series taken at the same distance: about 16 images spread over the series are aligned in full, their common lens geometry is learned, and every other image only *verifies and refines* that geometry on its own content. Frames that do not match are aligned in full as usual. A full alignment takes about 2.5 s per 61 MP image (synthetic test, without RAW decoding) and a verified consensus image about 1 s. Details: [batch consensus mode](docs/TECHNICAL_NOTES.md#batch-consensus-mode).
+
+## Outputs
+
+For `D:/survey/DSC06664.ARW`:
 
 ```text
-DSC06664/
-├── split_lens_images/
-│   ├── 1.jpg
-│   ├── 2.jpg
-│   ├── 3.jpg
-│   ├── 4.jpg
-│   ├── 5.jpg
-│   └── 6.jpg
-├── DSC06664_aligned_multiband.tif
-├── DSC06664_aligned_multiband_alignment_quality.txt
-└── DSC06664_aligned_multiband_alignment_quality.csv
+D:/survey/
+├── DSC06664.ARW
+├── DSC06664_ARW/
+│   ├── split_lens_images/1.tif … 6.tif
+│   ├── DSC06664_ARW_aligned_multiband.tif                    ← aligned bands
+│   ├── DSC06664_ARW_aligned_multiband_metadata.json          ← camera, bands, crop
+│   ├── DSC06664_ARW_aligned_multiband_alignment_quality.txt  ← quality report
+│   └── DSC06664_ARW_aligned_multiband_alignment_quality.csv
+├── tiff/
+│   └── DSC06664_ARW_aligned_multiband.tif                    ← all TIFFs in one place
+└── msalign_runs/
+    ├── 20261105_141502.log                                   ← run log
+    └── 20261105_141502_summary.csv                           ← one row per image
 ```
 
-## Supported input formats
+- **Multiband TIFF:** one image with all bands in the configured wavelength order, the same size for every image (2048 × 2048 px for the reference camera). 8-bit for JPG input, 16-bit for RAW input. GDAL, QGIS, rasterio and ENVI read it as one multiband raster.
+- **Metadata in the TIFF:** camera make and model, lens, focal length and pixel size; for every band its name (`405 nm`), centre wavelength, band width, lens and sensor channel; and the processing record (msalign version, alignment mode, lens shifts, crop position). See [Metadata](#metadata).
+- **`tiff/` folder:** a hard link by default — the same file under a second name, using no extra disk space. Can be switched to a real copy or off.
+- **Quality report:** for every lens pair the method, shift, support and confidence, plus the [closure check](#closure-check).
+- **Run summary:** status, alignment mode, quality and closure result of every image of a run, written as the run progresses.
 
-| Type | Extensions | Split lens images | Final TIFF |
-|---|---|---|---|
-| Standard | `.jpg`, `.jpeg`, `.png`, `.tif`, `.tiff` | `1.jpg … 6.jpg` | 8-bit |
-| Camera RAW | `.arw`, `.raw` (also `.dng`, `.nef`, `.cr2`, `.cr3`, `.orf`, `.rw2`, `.raf`, `.pef`, `.srw`) | `1.tif … 6.tif` (16-bit, lossless) | 16-bit |
+RAW outputs carry the RAW extension in their name (`DSC06664_ARW`), so the RAW and JPG of the same shot never overwrite each other. In batch consensus mode the split lens images are not kept unless `batch_keep_split_images` is enabled (about 200 MB per RAW image).
 
-RAW files are decoded with [rawpy](https://github.com/letmaik/rawpy) (LibRaw) as close to the sensor data as possible: no white balance, no camera colour matrix, linear response and no automatic brightening. Each sensor channel therefore stays a separate spectral measurement, and the same band mapping is used as for JPG input.
+### Supported input formats
 
-RAW outputs get the RAW extension in their name, so a RAW+JPG pair of the same shot does not overwrite each other — for example `DSC06664.ARW` produces `DSC06664_ARW/` and `DSC06664_ARW_aligned_multiband.tif`.
+| Type | Extensions | Final TIFF |
+|---|---|---|
+| Standard | `.jpg` `.jpeg` `.png` `.tif` `.tiff` | 8-bit |
+| Camera RAW | `.arw` `.raw` `.dng` `.nef` `.cr2` `.cr3` `.orf` `.rw2` `.raf` `.pef` `.srw` | 16-bit |
 
-The final TIFF contains 14 bands in wavelength order:
+RAW files are decoded with [rawpy](https://github.com/letmaik/rawpy) / LibRaw as close to the sensor data as possible: no white balance, no camera colour matrix, linear response, no automatic brightening. Each sensor channel stays a separate spectral measurement. For quantitative work, prefer RAW: camera JPGs are 8-bit, lossy, and their colour processing mixes the channels.
 
-`405, 430, 450, 490, 525, 550, 560, 570, 630, 650, 685, 710, 735, 850 nm`
+## Metadata
 
-## Current spectral configuration
+| Information | Where it comes from | Where it is written |
+|---|---|---|
+| Camera make, model, serial | EXIF of the source image | TIFF `Make` / `Model`, GDAL metadata, JSON |
+| Lens, focal length, pixel size | `camera` settings (EXIF if present) | TIFF/EP `FocalLength`, `FocalPlaneX/YResolution`, GDAL metadata, JSON |
+| Band name, centre wavelength, FWHM | `file_bands`, `output_order`, `camera.band_fwhm_nm` | GDAL band description and `CENTRAL_WAVELENGTH_UM` / `FWHM_UM`, JSON |
+| Acquisition date, exposure, ISO | EXIF | TIFF `DateTime`, JSON |
+| Alignment mode, lens shifts, crop origin | msalign | TIFF `ImageDescription` (JSON), sidecar JSON |
 
-| Band | Wavelength |
-|---:|---:|
-| 1 | 405 nm |
-| 2 | 430 nm |
-| 3 | 450 nm |
-| 4 | 490 nm |
-| 5 | 525 nm |
-| 6 | 550 nm |
-| 7 | 560 nm |
-| 8 | 570 nm |
-| 9 | 630 nm |
-| 10 | 650 nm |
-| 11 | 685 nm |
-| 12 | 710 nm |
-| 13 | 735 nm |
-| 14 | 850 nm |
+Settings win over EXIF; anything that is neither configured nor in the EXIF is left out rather than guessed. The defaults describe the reference camera — Agrowing Sextuple lens (effective focal length 21.8 mm, 30 nm bands) on a Sony 61 MP body, whose EXIF supplies make and model. A configuration for another camera (different grid, cell size or bands) does not inherit these lens values.
 
-The current reference implementation assumes a six-lens compound image arranged in a 3 × 2 layout. Other camera layouts or wavelength configurations may require changes to the split geometry and band mapping.
+## Configuration
 
-## Alignment strategy
+All settings have defaults for the reference camera. To change them, copy [`pipeline_config.example.json`](pipeline_config.example.json) to `pipeline_config.json` next to the `.exe` (or pass `--config FILE`) and keep only what you change. Unknown or inconsistent settings are rejected with a clear message at start-up. Every setting is documented in [`src/msalign/settings.py`](src/msalign/settings.py).
 
-The software uses a staged registration strategy:
+| Setting | Default | Meaning |
+|---|---|---|
+| `grid_cols`, `grid_rows` | 3, 2 | Lens array; lenses are numbered row by row from 1 |
+| `cell_size` | 3168 | Expected size of one lens cell in the compound image (px) |
+| `center_crop_frac` | 0.80 | Centred part of each cell that is kept |
+| `file_bands` | reference camera | Band in each sensor channel of each lens, e.g. `{"R": "710", "G": "570", "B": "405"}` |
+| `output_order` | 405 … 850 | Band order in the output TIFF |
+| `camera` | Agrowing Sextuple | Lens, focal length, pixel size and band width written into the TIFF |
+| `output_size_px` | [2048, 2048] | Fixed output size; `null` = largest area all lenses share |
+| `output_anchor` | `common_area_center` | Position of the output window (see [Output size](#output-size)) |
+| `tiff_layout` | `multiband` | `multiband`, or `multipage` (one page per band, as before 1.1) |
+| `tiff_compression` | `none` | `none` or `deflate` (lossless, smaller files) |
+| `parallax_correction` | `false` | Depth-dependent correction with a shared disparity map (see [Depth parallax](#depth-parallax)) |
+| `raw_demosaic` | `linear` | `linear` keeps spectral bands separate; `ahd` is LibRaw's default |
+| `parallax_range_px` | [20, 360] | Expected shift between adjacent lenses along their baseline |
+| `closure_check` | `reject` | `reject`, `warn` or `off` |
+| `batch_threshold` | 50 | Number of images from which batch consensus mode is used |
+| `collection_mode` | `hardlink` | Second copy in `tiff/`: `hardlink`, `copy` or `off` |
+
+Example for a 2 × 2 camera with one band per lens:
+
+```json
+{
+  "grid_cols": 2,
+  "grid_rows": 2,
+  "cell_size": 2000,
+  "file_bands": {"1": {"B": "450"}, "2": {"G": "550"},
+                 "3": {"R": "650"}, "4": {"R": "850"}},
+  "output_order": ["450", "550", "650", "850"]
+}
+```
+
+## How it works
+
+Every lens is related to the others by a translation (`dx`, `dy`): fixed lens geometry plus a parallax that depends on the subject distance. msalign estimates these translations in stages and accepts a result only when the image supports it.
 
 ```text
-Primary registration
-        ↓ if rejected
-Plan B — directional patch consensus
-        ↓ if rejected
-Plan C — feature-based translation
-        ↓ if still rejected and history exists
-History-guided pre-shift
-        ↓
-Primary → Plan B → Plan C again on the small residual
+Primary         every lens directly against lens 1
+                (phase correlation + patch consensus)
+   ↓ any pair rejected, or closure check failed
+Fallback chain  short steps between adjacent lenses through the array centre
+                (e.g. 2→1, 2→3, 2→5, 5→4, 5→6 for 3 × 2), each step:
+                directional patch consensus → AKAZE features → history-guided retry
+   ↓
+Closure check   independent test of every shift on the image
+   ↓ still failing
+Second pass     retry with the lens geometry of the nearest successful images
+   ↓ still failing
+Error           reported for manual inspection — nothing is forced
 ```
 
-Historical information is used as a **starting estimate**, not as an automatic answer. The current image must still provide supporting registration evidence before the result is accepted.
+The fallback only searches in the direction of each lens baseline (`parallax_range_px`), which keeps it away from fixed-pattern matches at zero shift.
 
-The current geometric model is global translation (`dx`, `dy`). It does not perform dense optical-flow or non-rigid pixel-by-pixel deformation. More implementation detail is available in [Technical Notes](docs/TECHNICAL_NOTES.md).
+### Closure check
 
-## Alignment quality report
+The alignment measures only some lens pairs directly; all other relative shifts follow from them. The closure check looks at the image again with one independent metric — a small, bounded correlation search around each implied shift:
 
-Every completed TIFF receives text and CSV quality reports containing the registration method, estimated displacement, support and confidence information for each lens pair.
+- **closure pairs** — adjacent lenses that were *not* measured directly (1–4 and 3–6 in the fallback chain): an error anywhere in the chain shows up here;
+- **measured pairs** — re-checked with the same metric, so every shift is judged on the same scale.
 
-When historical geometry was used, the report also records:
+A pair fails when the best local match is not at the implied shift, or when the implied shift has far weaker support than the other pairs of the same image. With `closure_check: reject` (default) a failed check sends the image to the next stage; with `warn` it is only reported and the quality is set to *low*. The report lists every checked pair with residual and correlation.
 
-- whether a historical prior was used;
-- how many successful images supported that prior;
-- the small residual correction found after the pre-shift.
+### Depth parallax
 
-The reported quality is an **alignment quality indicator**, not a biological classification accuracy or an ecological confidence score.
+One translation per lens is exact only for a flat scene. In close-range scenes, nearer surfaces have more parallax between the lenses than farther ones. Every image therefore gets a **local residual check**: the remaining misalignment of each lens is measured on image tiles and reported (median and 90th percentile, in px). The report suggests a correction when it is large.
 
-## Running from Python
+With `"parallax_correction": true`, msalign corrects it. The lenses form a small camera array on a regular grid, so the remaining displacement of every lens follows from **one disparity map shared by all lenses** times that lens's grid offset (multi-baseline stereo). The map is estimated by a plane sweep on gradient images, which works across spectral bands. Bands are then resampled (bilinear). The correction is kept only if the residual check measurably improves; otherwise the global alignment is kept. The disparity map is saved as `<name>_parallax.tif`.
 
-Users who want to inspect or modify the source can run it directly.
+On a close-range Agrowing image (DSC05928, stone object with a raised block), it reduced the local misalignment from a median of 3.6 px and a worst lens 90th percentile of 25.7 px to 1.3 px and 4.8 px, at about 5 s extra per image.
 
-```powershell
-python -m venv .venv
-.venv\Scripts\activate
-python -m pip install -r requirements.txt
-python src\run_pipeline_gui.py
-```
+### Output size
 
-Python 3.11–3.13 is recommended. OpenCV is constrained to a 4.x build because the feature fallback uses the `AKAZE_create` API.
+After alignment, every image is cut to the same size. The cut happens **after** alignment and uses one window for all bands of an image, so it does not change the alignment between bands. Two placements are available:
 
-## Repository structure
+- `common_area_center` (default) — the window is centred on the area that all lenses share. Because that area depends on the subject distance, the window's origin can differ by a few pixels between images.
+- `fixed` — the window has the same origin in the reference lens for every image (centred on `output_fixed_center_px`), for pixel-to-pixel comparisons across a series.
 
-```text
-.github/    GitHub Actions Windows build workflow
-build/      PyInstaller / Windows build files
-docs/       Technical implementation notes
-examples/   Example-data guidance
-src/        Alignment, stacking and desktop interface
-```
+Either way the origin is recorded per image — in reference-lens pixels and in pixels of the full source image — in the metadata, the quality report and the run summary. If the shared area is smaller than the window, the image fails with a clear message instead of being padded, unless `output_max_padding_px` allows padding (padded pixels are 0 and marked as nodata).
 
-## Building the Windows executable locally
-
-On Windows, run:
-
-```text
-build\build_windows.bat
-```
-
-The executable is built as:
-
-```text
-build-output\Automated_Multispectral_Alignment.exe
-```
-
-The PyInstaller configuration uses windowed mode, so the packaged application opens the graphical processing interface without a separate black command-prompt window.
-
-## Intended applications
-
-Potential uses include close-range multispectral imaging, underwater and marine imaging, laboratory imaging, environmental monitoring, biological imagery, material analysis, and preparation of registered multispectral datasets for machine-learning or deep-learning workflows.
+More detail: [Technical Notes](docs/TECHNICAL_NOTES.md).
 
 ## Validation and responsible use
 
-Automatic registration should still be visually checked for scientifically important datasets, particularly when scenes contain strong depth-dependent parallax, moving subjects, low texture, major occlusion or severe spectral/illumination differences.
+- Inspect a representative subset visually before quantitative analysis, especially scenes with strong depth differences, moving subjects, little texture, occlusion or very different illumination between bands.
+- By default the geometric model is a global translation per lens. Close-range scenes with depth keep local parallax unless `parallax_correction` is enabled; check the local residual line in the quality report. Occluded areas (visible from one lens but not another) cannot be aligned by any method and remain.
+- The reported quality is an **alignment** quality indicator, not a statement about the scientific content of the bands.
+- A failed alignment is intentionally preferred over silently accepting an unsupported one.
 
-A failed alignment is intentionally preferable to silently accepting a geometrically unsupported result.
+## Development
 
-## Status
+```bash
+git clone https://github.com/SirAfes/Automated-Multispectral-Alignment.git
+cd Automated-Multispectral-Alignment
+python -m pip install -e ".[dev]"
+python -m pytest
+```
 
-This project is under active research development. Registration criteria, camera configuration and interface features may evolve as additional close-range multispectral datasets are evaluated.
+The tests build synthetic compound images with known lens shifts (JPG, RAW, other grid sizes, batch series with outliers) and run on every push on Windows and Linux.
+
+```text
+src/msalign/
+├── gui.py, cli.py          desktop app and command line
+├── pipeline.py             one image / a whole run, run files
+├── batch.py                batch consensus mode
+├── stack.py                alignment strategy, TIFF export, reports
+├── alignment.py            primary estimator (phase correlation + patches)
+├── fallback.py             directional patches, AKAZE, history-guided retry
+├── layout.py               lens array geometry
+├── closure.py, matching.py closure check, bounded local matching
+├── parallax.py             local residual check, depth parallax correction
+├── split.py, image_io.py   splitting, reading JPG/TIFF/RAW
+├── metadata.py             EXIF, camera / band / processing metadata
+└── settings.py             settings and validation
+build/                      PyInstaller build of the Windows executable
+docs/                       technical notes
+tests/                      automated tests
+```
+
+To build the Windows executable locally, run `build\build_windows.bat`.
+
+Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Citation
+
+If you use msalign in research, please cite it — see [CITATION.cff](CITATION.cff) (GitHub shows a *Cite this repository* button).
 
 ## License
 
-See the repository `LICENSE` file for the current license terms.
+[MIT](LICENSE)
