@@ -131,7 +131,7 @@ All settings have defaults for the reference camera. To change them, copy [`pipe
 | `grid_cols`, `grid_rows` | 3, 2 | Lens array; lenses are numbered row by row from 1 |
 | `cell_size` | 3168 | Expected size of one lens cell in the compound image (px) |
 | `center_crop_frac` | 0.80 | Centred part of each cell that is kept |
-| `file_bands` | reference camera | Band label in the R, G, B channel of each lens (`"0"` = unused) |
+| `file_bands` | reference camera | Band in each sensor channel of each lens, e.g. `{"R": "710", "G": "570", "B": "405"}` |
 | `output_order` | 405 … 850 | Band order in the output TIFF |
 | `camera` | Agrowing Sextuple | Lens, focal length, pixel size and band width written into the TIFF |
 | `output_size_px` | [2048, 2048] | Fixed output size; `null` = largest area all lenses share |
@@ -150,8 +150,8 @@ Example for a 2 × 2 camera with one band per lens:
   "grid_cols": 2,
   "grid_rows": 2,
   "cell_size": 2000,
-  "file_bands": {"1": ["450", "0", "0"], "2": ["0", "550", "0"],
-                 "3": ["0", "0", "650"], "4": ["0", "0", "850"]},
+  "file_bands": {"1": {"B": "450"}, "2": {"G": "550"},
+                 "3": {"R": "650"}, "4": {"R": "850"}},
   "output_order": ["450", "550", "650", "850"]
 }
 ```

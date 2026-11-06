@@ -8,6 +8,11 @@
 - Fixed output size for every image (`output_size_px`, default 2048 x 2048 for the reference camera), placed at the centre of the shared lens area or at a fixed position (`output_anchor`). The crop origin is recorded in reference-lens and source-image pixels in the metadata, quality report and run summary.
 - Optional lossless deflate compression (`tiff_compression`).
 
+### Fixed
+
+- **Band assignment of the reference camera.** The band table used up to 1.0 had the R and B labels of every lens exchanged and lenses 5 and 6 exchanged, so 10 of the 14 bands carried another band's data and two (630, 560 nm) came from the wrong sensor channel. Verified against Agrowing's own output and Bayer sensor physics (see Technical Notes). Outputs made with earlier versions should be reprocessed.
+- `file_bands` can name the sensor channel explicitly (`{"R": .., "G": .., "B": ..}`); lists are still read as [R, G, B].
+
 ### Changed
 
 - The TIFF is one multiband image instead of one page per band, so GDAL / QGIS / rasterio / ENVI read all bands with their wavelengths. `tiff_layout: multipage` restores the previous layout.

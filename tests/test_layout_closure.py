@@ -145,3 +145,30 @@ def test_cli_bad_setting(tmp_path, capsys):
     code = cli_main([str(tmp_path), "--set", "closure_check=maybe"])
     assert code == 2
     assert "closure_check" in capsys.readouterr().err
+
+
+def test_reference_band_table_follows_sensor_physics():
+    """Bayer R pixels carry the longest band of a lens, B pixels the shortest."""
+    from msalign.settings import DEFAULT_SETTINGS, file_bands_int
+
+    table = file_bands_int(DEFAULT_SETTINGS)
+    assert table[3] == ("710", "570", "405")
+    assert table[5] == ("735", "0", "490") and table[6] == ("685", "560", "450")
+    for lens, (r, g, b) in table.items():
+        used = [float(x) for x in (r, g, b) if x != "0"]
+        assert used == sorted(used, reverse=True), f"lens {lens}: {r, g, b}"
+
+
+def test_band_table_dict_and_list_forms_agree(tmp_path):
+    from msalign.settings import file_bands_int
+
+    as_dict = load_settings(tmp_path / "none.json", {"file_bands": {
+        "1": {"R": "850"}, "2": {"R": "630", "G": "525"}, "3": {"R": "710", "G": "570", "B": "405"},
+        "4": {"R": "650", "G": "550", "B": "430"}, "5": {"R": "735", "B": "490"},
+        "6": {"R": "685", "G": "560", "B": "450"}}})
+    as_list = load_settings(tmp_path / "none.json", {"file_bands": {
+        "1": ["850", "0", "0"], "2": ["630", "525", "0"], "3": ["710", "570", "405"],
+        "4": ["650", "550", "430"], "5": ["735", "0", "490"], "6": ["685", "560", "450"]}})
+    assert file_bands_int(as_dict) == file_bands_int(as_list)
+    with pytest.raises(ValueError, match="unknown channel"):
+        load_settings(tmp_path / "none.json", {"file_bands": {**as_dict["file_bands"], "1": {"NIR": "850"}}})

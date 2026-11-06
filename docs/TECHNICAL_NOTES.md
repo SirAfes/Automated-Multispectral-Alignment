@@ -167,20 +167,28 @@ This keeps the transformation interpretable and avoids inventing local geometric
 
 ## Band configuration (reference camera)
 
-Set with `file_bands` and `output_order` in the settings file.
+Set with `file_bands` and `output_order` in the settings file. Each lens of the Agrowing Sextuple has a multi-bandpass filter; every band reaches the sensor channel that is most sensitive to it.
 
-| Lens image | Bands (nm) |
-|---|---|
-| 1 | 850 |
-| 2 | 525, 630 |
-| 3 | 405, 570, 710 |
-| 4 | 430, 550, 650 |
-| 5 | 450, 560, 685 |
-| 6 | 490, 735 |
+| Lens image | R channel | G channel | B channel |
+|---|---|---|---|
+| 1 | 850 | – | – |
+| 2 | 630 | 525 | – |
+| 3 | 710 | 570 | 405 |
+| 4 | 650 | 550 | 430 |
+| 5 | 735 | – | 490 |
+| 6 | 685 | 560 | 450 |
 
 Final order:
 
 `405, 430, 450, 490, 525, 550, 560, 570, 630, 650, 685, 710, 735, 850 nm`
+
+**How the table was verified.** Versions before 1.1 used a table in which every lens had its R and B labels exchanged and lenses 5 and 6 were exchanged. This was found by comparing an msalign output with Agrowing's own software for the same RAW image (DSC05928):
+
+- *Sensor physics.* Bayer red pixels hardly respond at 430–490 nm and blue pixels hardly respond at 650–735 nm. In the old output, blue channels labelled 650/685/735 nm were bright and red channels labelled 430/450/490 nm were dark. That is only possible if the labels are reversed.
+- *Content match.* After whole-pixel registration, each band of the old output matched the Agrowing band predicted by the corrected table (phase-correlation responses 0.31–0.85, compared with < 0.1 for the other bands). Lens 1 (850 nm, single filter) could not be cross-checked this way; its band is read from the red channel.
+- *Two-band lens.* The G channel of lens 5 was almost fully explained by its own R and B channels (R² 0.98, compared with 0.95 for three-band lenses), as expected for the lens without a green band.
+
+The regression test `test_reference_band_table_follows_sensor_physics` keeps the rule *R = longest, B = shortest band of each lens*.
 
 ## Quality reports
 

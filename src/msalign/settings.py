@@ -65,13 +65,19 @@ DEFAULT_SETTINGS = {
     # --- Band mapping -------------------------------------------------------
     # Lens image number -> wavelength label stored in its (R, G, B) channels.
     # "0" means the channel is not used.
+    # Written per sensor channel, e.g. {"R": "710", "G": "570", "B": "405"};
+    # channels without a band are left out. (A list is read as [R, G, B],
+    # with "0" for an unused channel.)
+    # Verified on Agrowing Sextuple data: Bayer red pixels carry the longest
+    # band of each lens and blue pixels the shortest, matching Agrowing's own
+    # software. Lens 1: the NIR band is read from the red channel.
     "file_bands": {
-        "1": ["0", "0", "850"],
-        "2": ["0", "525", "630"],
-        "3": ["405", "570", "710"],
-        "4": ["430", "550", "650"],
-        "5": ["450", "560", "685"],
-        "6": ["490", "0", "735"],
+        "1": {"R": "850"},
+        "2": {"R": "630", "G": "525"},
+        "3": {"R": "710", "G": "570", "B": "405"},
+        "4": {"R": "650", "G": "550", "B": "430"},
+        "5": {"R": "735", "B": "490"},
+        "6": {"R": "685", "G": "560", "B": "450"},
     },
     # Band order in the output TIFF.
     "output_order": [
@@ -221,9 +227,8 @@ def validate_settings(settings: dict) -> dict:
         )
 
     available = set()
-    for lens, labels in bands.items():
-        if len(labels) != 3:
-            raise ValueError(f"file_bands['{lens}'] must have exactly 3 entries (R, G, B)")
+    for lens in bands:
+        labels = channel_labels(bands[lens], lens)
         for label in labels:
             if label != "0":
                 if label in available:
@@ -297,5 +302,26 @@ def load_settings(path: Path | None = None, overrides: dict | None = None) -> di
     return validate_settings(settings)
 
 
+CHANNELS = ("R", "G", "B")
+
+
+def channel_labels(entry, lens="?") -> tuple[str, str, str]:
+    """
+    Band labels of one lens as (R, G, B), "0" for unused channels.
+    Accepts {"R": "710", "G": "570", "B": "405"} or ["710", "570", "405"].
+    """
+    if isinstance(entry, dict):
+        unknown = set(entry) - set(CHANNELS)
+        if unknown:
+            raise ValueError(f"file_bands['{lens}']: unknown channel(s) {sorted(unknown)}; use R, G, B")
+        return tuple(str(entry.get(ch) or "0") for ch in CHANNELS)
+    if isinstance(entry, (list, tuple)) and len(entry) == 3:
+        return tuple(str(v) for v in entry)
+    raise ValueError(
+        f"file_bands['{lens}'] must be {{\"R\": .., \"G\": .., \"B\": ..}} or a list [R, G, B]"
+    )
+
+
 def file_bands_int(settings: dict) -> dict[int, tuple[str, str, str]]:
-    return {int(k): tuple(v) for k, v in settings["file_bands"].items()}
+    """{lens: (R label, G label, B label)}."""
+    return {int(k): channel_labels(v, k) for k, v in settings["file_bands"].items()}
