@@ -36,6 +36,7 @@ from .fallback import estimate_xy_plan_b
 from .image_io import find_split_set
 from .layout import LensLayout, layout_from_settings
 from .matching import PreparedImages
+from .metadata import build_metadata, tiff_tags, write_sidecar
 from .settings import DEFAULT_SETTINGS, file_bands_int
 
 
@@ -445,6 +446,28 @@ def write_alignment_quality_report(output_tiff: Path, export_result):
         f"Minimum support: {summary['min_support']}",
     ]
 
+    out = export_result.get("output") or {}
+    if out:
+        pad = out.get("padded_pixels", 0)
+        lines.append(
+            f"Output: {out['width']}x{out['height']} px, {out['bands']} bands, pixel grid of lens "
+            f"{out['frame_lens']}, window {out['anchor']}, origin {tuple(out['origin_in_reference_lens_px'])} "
+            f"in lens {out['frame_lens']}"
+            + (f" / {tuple(out['origin_in_source_px'])} in the source image" if out.get("origin_in_source_px") else "")
+            + (f", {pad} px padded with 0 (nodata)" if pad else "")
+        )
+        ca = out["common_area_in_reference_lens_px"]
+        lines.append(f"Shared area of all lenses: {ca['width']}x{ca['height']} px at ({ca['x']}, {ca['y']})")
+
+    cam = export_result.get("camera") or {}
+    if cam:
+        lines.append(
+            "Camera: " + ", ".join(
+                f"{k}={cam[k]}" for k in ("make", "model", "lens", "focal_length_mm", "pixel_size_um_output")
+                if k in cam
+            )
+        )
+
     split_info = export_result.get("split_info") or {}
     if split_info:
         lines.append(
@@ -539,6 +562,8 @@ def export_multipage_tiff_from_split(
     output_order=None,
     split_info=None,
     settings=None,
+    source_path=None,
+    exif=None,
 ):
     """Align the lens images and export the multiband TIFF.
 
@@ -566,21 +591,98 @@ def export_multipage_tiff_from_split(
         file_bands=file_bands,
         output_order=output_order,
         split_info=split_info,
+        settings=settings,
+        source_path=source_path,
+        exif=exif,
     )
 
 
-def apply_translation(img, dx, dy):
-    """Integer translation; uncovered pixels become 0."""
-    h, w = img.shape[:2]
-    M = np.float32([[1, 0, float(dx)], [0, 1, float(dy)]])
-    return cv2.warpAffine(
-        img,
-        M,
-        (w, h),
-        flags=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=0,
-    )
+def _quality_brief(alignment_result):
+    try:
+        summary = summarize_alignment_quality(alignment_result)
+    except Exception:
+        return None
+    return {"overall": summary["overall_quality"], "closure_check": summary["closure_status"]}
+
+
+def write_tiff(path: Path, data, meta, output_order, settings):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tags = tiff_tags(meta)
+    compression = "zlib" if settings["tiff_compression"] == "deflate" else None
+    common = {
+        "software": tags["software"],
+        "extratags": tags["extratags"],
+        "compression": compression,
+    }
+    if tags["datetime"]:
+        common["datetime"] = tags["datetime"]
+
+    if settings["tiff_layout"] == "multiband":
+        tifffile.imwrite(
+            str(path), data,
+            photometric="minisblack", planarconfig="separate",
+            description=tags["description"], metadata=None,
+            **common,
+        )
+        return
+
+    # legacy: one page per band; camera tags and band information on page 1
+    with tifffile.TiffWriter(str(path)) as tif:
+        for i, label in enumerate(output_order):
+            extra = common if i == 0 else {"compression": compression}
+            tif.write(
+                data[i], photometric="minisblack", contiguous=False,
+                metadata={"band_name": label}, **extra,
+            )
+
+
+def output_window(shifts, lens_w, lens_h, settings):
+    """
+    Output window in the pixel grid of the reference lens.
+
+    `shifts` are apply shifts relative to the reference lens. Lens k covers
+    [dx_k, lens_w + dx_k) x [dy_k, lens_h + dy_k) of that grid; the common area
+    is the intersection over all lenses.
+    """
+    dxs = [v["dx"] for v in shifts.values()]
+    dys = [v["dy"] for v in shifts.values()]
+    cx0, cx1 = max(0, max(dxs)), min(lens_w, lens_w + min(dxs))
+    cy0, cy1 = max(0, max(dys)), min(lens_h, lens_h + min(dys))
+    if cx1 <= cx0 or cy1 <= cy0:
+        raise RuntimeError("No common valid area found after alignment.")
+
+    size = settings["output_size_px"]
+    if size is None:
+        ox, oy, ww, wh = cx0, cy0, cx1 - cx0, cy1 - cy0
+        anchor = "common_area"
+    else:
+        ww, wh = int(size[0]), int(size[1])
+        anchor = settings["output_anchor"]
+        if anchor == "fixed":
+            center = settings["output_fixed_center_px"] or (lens_w / 2, lens_h / 2)
+            ox = int(round(center[0] - ww / 2))
+            oy = int(round(center[1] - wh / 2))
+        else:
+            ox = (cx0 + cx1 - ww) // 2
+            oy = (cy0 + cy1 - wh) // 2
+
+    padding = {
+        "left": max(0, cx0 - ox),
+        "right": max(0, ox + ww - cx1),
+        "top": max(0, cy0 - oy),
+        "bottom": max(0, oy + wh - cy1),
+    }
+    ix0, ix1 = max(ox, cx0), min(ox + ww, cx1)
+    iy0, iy1 = max(oy, cy0), min(oy + wh, cy1)
+    covered = max(0, ix1 - ix0) * max(0, iy1 - iy0)
+
+    return {
+        "x": ox, "y": oy, "width": ww, "height": wh, "anchor": anchor,
+        "common_area": {"x": cx0, "y": cy0, "width": cx1 - cx0, "height": cy1 - cy0},
+        "inner": (ix0, ix1, iy0, iy1),
+        "padding_px": padding,
+        "padded_pixels": int(ww * wh - covered),
+    }
 
 
 def export_aligned_tiff(
@@ -591,73 +693,112 @@ def export_aligned_tiff(
     file_bands=None,
     output_order=None,
     split_info=None,
+    settings=None,
+    source_path=None,
+    exif=None,
 ):
-    """Apply alignment_result['apply_shifts'], crop the common area and write the TIFF."""
-    apply_shifts = alignment_result["apply_shifts"]
+    """
+    Cut every band from its lens image at the aligned position, inside one
+    output window in the reference-lens pixel grid, and write the TIFF with
+    camera / band / processing metadata.
+    """
+    settings = settings or DEFAULT_SETTINGS
+    split_info = split_info or {}
+    layout = _layout(settings)
+    ref = layout.primary_reference
+    output_order = output_order or OUTPUT_ORDER
+
+    raw = alignment_result["apply_shifts"]
+    # Express all shifts in the pixel grid of the primary reference lens, so the
+    # output grid is the same whichever alignment mode was used.
+    shifts = {
+        k: {"dx": int(v["dx"]) - int(raw[ref]["dx"]), "dy": int(v["dy"]) - int(raw[ref]["dy"])}
+        for k, v in raw.items()
+    }
 
     log.info(
-        "Alignment mode: %s | shifts: %s",
-        alignment_result["mode"],
-        ", ".join(f"{k}=({v['dx']},{v['dy']})" for k, v in sorted(apply_shifts.items())),
+        "Alignment mode: %s | shifts (lens %s grid): %s",
+        alignment_result["mode"], ref,
+        ", ".join(f"{k}=({v['dx']},{v['dy']})" for k, v in sorted(shifts.items())),
     )
 
-    ref_h, ref_w = images[1].shape[:2]
+    lens_h, lens_w = images[ref].shape[:2]
     for idx, img in images.items():
-        h, w = img.shape[:2]
-        if (h, w) != (ref_h, ref_w):
+        if img.shape[:2] != (lens_h, lens_w):
             raise ValueError(f"Image size mismatch in split set: image {idx}")
 
-    warped = {}
-    common = np.full((ref_h, ref_w), 255, dtype=np.uint8)
-
-    for idx, img in images.items():
-        dx = int(apply_shifts[idx]["dx"])
-        dy = int(apply_shifts[idx]["dy"])
-        warped[idx] = apply_translation(img, dx, dy)
-
-        # Valid area = where the shifted lens image actually has data.
-        frame = np.full((ref_h, ref_w), 255, dtype=np.uint8)
-        valid = cv2.warpAffine(
-            frame,
-            np.float32([[1, 0, dx], [0, 1, dy]]),
-            (ref_w, ref_h),
-            flags=cv2.INTER_NEAREST,
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=0,
+    win = output_window(shifts, lens_w, lens_h, settings)
+    max_pad = max(win["padding_px"].values())
+    if max_pad > int(settings["output_max_padding_px"]):
+        raise RuntimeError(
+            f"shared area of the lenses ({win['common_area']['width']}x{win['common_area']['height']} px) "
+            f"does not contain the {win['width']}x{win['height']} px output window "
+            f"(short by up to {max_pad} px); reduce output_size_px or allow output_max_padding_px"
         )
-        common = cv2.bitwise_and(common, valid)
-
-    ys, xs = (common > 0).nonzero()
-    if len(xs) == 0 or len(ys) == 0:
-        raise RuntimeError("No common valid area found after alignment.")
-
-    x0, x1 = int(xs.min()), int(xs.max()) + 1
-    y0, y1 = int(ys.min()), int(ys.max()) + 1
 
     band_map = build_band_map(file_bands)
-    output_tiff.parent.mkdir(parents=True, exist_ok=True)
+    ix0, ix1, iy0, iy1 = win["inner"]
+    ox, oy = win["x"], win["y"]
+    dtype = images[ref].dtype
+    data = np.zeros((len(output_order), win["height"], win["width"]), dtype=dtype)
+    for b, label in enumerate(output_order):
+        lens, ch = band_map[label]
+        dx, dy = shifts[lens]["dx"], shifts[lens]["dy"]
+        src = images[lens]
+        plane = src[:, :, ch] if src.ndim == 3 else src
+        # aligned(x, y) = lens(x - dx, y - dy)
+        data[b, iy0 - oy:iy1 - oy, ix0 - ox:ix1 - ox] = plane[iy0 - dy:iy1 - dy, ix0 - dx:ix1 - dx]
+
+    origins = split_info.get("lens_origins") or {}
+    scale = float(split_info.get("lens_scale", 1.0))
+    output = {
+        "width": win["width"],
+        "height": win["height"],
+        "bands": len(output_order),
+        "frame_lens": ref,
+        "anchor": win["anchor"],
+        # top-left output pixel in the reference lens image ...
+        "origin_in_reference_lens_px": [ox, oy],
+        "common_area_in_reference_lens_px": win["common_area"],
+        "padding_px": win["padding_px"],
+        "padded_pixels": win["padded_pixels"],
+        "shifts": shifts,
+    }
+    if str(ref) in origins:
+        # ... and in the full source (sensor) image
+        sx, sy = origins[str(ref)]
+        if scale == 1.0:
+            output["origin_in_source_px"] = [int(sx + ox), int(sy + oy)]
+        else:
+            output["origin_in_source_px"] = [round(sx + ox * scale, 2), round(sy + oy * scale, 2)]
 
     if status_callback:
         status_callback("Writing aligned multiband TIFF")
 
-    with tifffile.TiffWriter(str(output_tiff)) as tif:
-        for band_name in (output_order or OUTPUT_ORDER):
-            file_id, ch_idx = band_map[band_name]
-            band = warped[file_id][y0:y1, x0:x1, ch_idx]
+    meta = build_metadata(
+        settings=settings,
+        source_path=source_path,
+        exif=exif or {},
+        band_map=band_map,
+        output_order=output_order,
+        dtype=dtype,
+        output={k: v for k, v in output.items()},
+        alignment=alignment_result,
+        split_info=split_info,
+        quality=_quality_brief(alignment_result),
+    )
+    write_tiff(output_tiff, data, meta, output_order, settings)
+    metadata_json = write_sidecar(output_tiff, meta) if settings["write_metadata_json"] else None
 
-            tif.write(
-                band,
-                photometric="minisblack",
-                contiguous=False,
-                metadata={"band_name": band_name},
-            )
-
+    output.pop("shifts")
     export_result = {
         "alignment": alignment_result,
-        "crop_box": {"x0": x0, "y0": y0, "x1": x1, "y1": y1},
-        "final_size": {"width": x1 - x0, "height": y1 - y0},
+        "output": output,
+        "final_size": {"width": win["width"], "height": win["height"]},
         "output_tiff": str(output_tiff),
-        "split_info": split_info or {},
+        "metadata_json": str(metadata_json) if metadata_json else "",
+        "camera": meta["camera"],
+        "split_info": split_info,
     }
 
     if status_callback:

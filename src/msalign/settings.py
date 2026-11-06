@@ -13,11 +13,14 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import sys
 from pathlib import Path
 
 
 CONFIG_FILENAME = "pipeline_config.json"
+
+log = logging.getLogger(__name__)
 
 
 DEFAULT_SETTINGS = {
@@ -78,6 +81,51 @@ DEFAULT_SETTINGS = {
         "735", "850",
     ],
 
+    # --- Camera metadata ----------------------------------------------------
+    # Written into every TIFF. Values given here win over the source EXIF;
+    # null fields are taken from EXIF or left out (nothing is guessed).
+    # Defaults describe the reference camera: Agrowing Sextuple lens on a
+    # Sony 61 MP full-frame body (make / model come from the body's EXIF).
+    # Effective focal length and 30 nm band width: Agrowing specifications.
+    # Pixel size: 35.7 mm sensor width / 9504 px.
+    "camera": {
+        "make": None,
+        "model": None,
+        "lens": "Agrowing Sextuple",
+        "focal_length_mm": 21.8,
+        "pixel_size_um": 3.76,
+        # one value for all bands, or {"405": 30, ...}
+        "band_fwhm_nm": 30,
+        "serial_number": None,
+    },
+
+    # --- Output image -----------------------------------------------------------
+    # The output pixel grid is the grid of `primary_reference_lens`.
+    # Fixed output size [width, height] for every image, or null for the
+    # largest area all lenses share (size then varies slightly per image).
+    # 2048 fits the reference camera over its full focus range (0.5 m - inf).
+    "output_size_px": [2048, 2048],
+    # Where the fixed-size window is placed:
+    #   "common_area_center": centred on the area all lenses share (default);
+    #       the crop origin can differ by a few px between images and is
+    #       recorded in the metadata.
+    #   "fixed": same origin in reference-lens pixels for every image, centred
+    #       on `output_fixed_center_px` ([x, y] in the reference lens image,
+    #       null = its centre). For pixel-to-pixel comparison of series.
+    "output_anchor": "common_area_center",
+    "output_fixed_center_px": None,
+    # Pixels of the window outside the shared area are set to 0 (nodata).
+    # An image whose shared area is smaller than the window by more than this
+    # many pixels on any side fails instead of being written.
+    "output_max_padding_px": 0,
+    # "multiband": one image with N bands (GDAL / QGIS / ENVI read all bands);
+    # "multipage": one page per band (format of msalign < 1.1).
+    "tiff_layout": "multiband",
+    # "none" or "deflate" (lossless, smaller files).
+    "tiff_compression": "none",
+    # Also write <name>_metadata.json next to the TIFF.
+    "write_metadata_json": True,
+
     # --- Outputs ------------------------------------------------------------
     # Second copy of every final TIFF in <source folder>/tiff.
     #   "hardlink": same file, no extra disk space (falls back to copy if the
@@ -120,6 +168,13 @@ def _base_dir() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
+# Settings that describe a different camera than the reference camera. If a
+# configuration changes any of them, reference-camera defaults that would then
+# be wrong (lens metadata, output size) are dropped unless also configured.
+CAMERA_GEOMETRY_KEYS = {"grid_cols", "grid_rows", "cell_size", "center_crop_frac", "file_bands"}
+REFERENCE_CAMERA_KEYS = {"camera", "output_size_px"}
+
+
 def _merge(base: dict, override: dict) -> dict:
     out = copy.deepcopy(base)
     for key, value in override.items():
@@ -127,8 +182,30 @@ def _merge(base: dict, override: dict) -> dict:
             continue  # allows "_comment" keys in the JSON file
         if key not in out:
             raise ValueError(f"Unknown setting in {CONFIG_FILENAME}: '{key}'")
+        if key == "camera" and isinstance(value, dict):
+            merged = dict(out["camera"])
+            merged.update(value)
+            value = merged
         out[key] = value
     return out
+
+
+def _drop_reference_camera_defaults(settings: dict, configured: set) -> dict:
+    if not (configured & CAMERA_GEOMETRY_KEYS):
+        return settings
+    dropped = []
+    if "camera" not in configured:
+        settings["camera"] = {k: None for k in DEFAULT_SETTINGS["camera"]}
+        dropped.append("camera")
+    if "output_size_px" not in configured:
+        settings["output_size_px"] = None
+        dropped.append("output_size_px")
+    if dropped:
+        log.warning(
+            "Camera geometry differs from the reference camera; reference defaults for %s "
+            "are not used. Set them in the configuration if needed.", ", ".join(dropped),
+        )
+    return settings
 
 
 def validate_settings(settings: dict) -> dict:
@@ -169,6 +246,25 @@ def validate_settings(settings: dict) -> dict:
     if settings["closure_check"] not in {"reject", "warn", "off"}:
         raise ValueError("closure_check must be 'reject', 'warn' or 'off'")
 
+    size = settings["output_size_px"]
+    if size is not None:
+        if not (isinstance(size, (list, tuple)) and len(size) == 2 and all(int(v) > 0 for v in size)):
+            raise ValueError("output_size_px must be [width, height] or null")
+        lens = int(settings["cell_size"] * settings["center_crop_frac"])
+        if max(size) > lens:
+            raise ValueError(f"output_size_px {list(size)} is larger than a lens image ({lens} px)")
+
+    if settings["output_anchor"] not in {"common_area_center", "fixed"}:
+        raise ValueError("output_anchor must be 'common_area_center' or 'fixed'")
+    if settings["tiff_layout"] not in {"multiband", "multipage"}:
+        raise ValueError("tiff_layout must be 'multiband' or 'multipage'")
+    if settings["tiff_compression"] not in {"none", "deflate"}:
+        raise ValueError("tiff_compression must be 'none' or 'deflate'")
+
+    unknown = set(settings["camera"]) - set(DEFAULT_SETTINGS["camera"])
+    if unknown:
+        raise ValueError(f"Unknown camera setting(s): {sorted(unknown)}")
+
     if settings["collection_mode"] not in {"hardlink", "copy", "off"}:
         raise ValueError("collection_mode must be 'hardlink', 'copy' or 'off'")
 
@@ -182,17 +278,22 @@ def load_settings(path: Path | None = None, overrides: dict | None = None) -> di
     """Defaults, then pipeline_config.json (if present), then explicit overrides."""
     settings = copy.deepcopy(DEFAULT_SETTINGS)
 
+    configured = set()
     config_path = path or (_base_dir() / CONFIG_FILENAME)
     if config_path.is_file():
         with config_path.open("r", encoding="utf-8") as f:
-            settings = _merge(settings, json.load(f))
+            data = json.load(f)
+        settings = _merge(settings, data)
+        configured |= {k for k in data if not k.startswith("_")}
         settings["_source"] = str(config_path)
     else:
         settings["_source"] = "built-in defaults"
 
     if overrides:
         settings = _merge(settings, overrides)
+        configured |= set(overrides)
 
+    settings = _drop_reference_camera_defaults(settings, configured)
     return validate_settings(settings)
 
 

@@ -25,8 +25,11 @@ def relative_shifts(alignment):
 
 
 def read_bands(path):
+    """(bands, h, w) for both the multiband and the legacy multipage layout."""
     with tifffile.TiffFile(path) as tif:
-        return np.stack([page.asarray() for page in tif.pages])
+        if len(tif.pages) > 1:
+            return np.stack([page.asarray() for page in tif.pages])
+        return tif.pages[0].asarray()
 
 
 def assert_shifts(alignment, expected=SHIFTS, tol=1):

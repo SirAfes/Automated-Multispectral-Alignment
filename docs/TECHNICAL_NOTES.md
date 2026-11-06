@@ -143,6 +143,22 @@ Quality reports of consensus images record the consensus, the residual and the n
 
 The cost per consensus image is dominated by reading the file and writing the TIFF; the alignment search itself is skipped. Split lens images are not written for consensus images unless `batch_keep_split_images` is enabled.
 
+## Output window and metadata
+
+**Pixel grid.** All lens shifts are expressed relative to the primary reference lens, so the output pixel grid is that lens's grid whichever alignment mode was used. Lens *k* covers `[dx_k, W + dx_k) × [dy_k, H + dy_k)` of that grid; the shared area is the intersection over all lenses.
+
+**Cutting.** Each band is taken directly from its lens image at `lens(x - dx, y - dy)`. Shifts are whole pixels, so this is an exact copy without interpolation, and it avoids building a shifted copy of every lens image.
+
+**Window.** With `output_size_px` set, a window of that size is placed either at the centre of the shared area (`common_area_center`) or at a fixed position in the reference lens (`fixed`). The window is common to all bands of the image: it decides *which part of the scene* is kept, not how the bands line up. Its origin is recorded as `origin_in_reference_lens_px` and `origin_in_source_px` (reference-lens origin from the split step plus window origin, times the lens scale if cells had to be resized). The split step stores the lens origins in `split_lens_images/split_info.json`, so a second-pass retry reports the same coordinates. If the window is not fully inside the shared area by more than `output_max_padding_px`, the image fails.
+
+For the reference camera, the lens baseline (≈ 11.9 mm, one cell of 3168 px × 3.76 µm) and the effective focal length of 21.8 mm give a parallax of roughly 140 px per lens step at the 0.5 m minimum focus distance and close to 0 px at infinity. The shared area is then at least about 2534 − 2 × 140 ≈ 2250 px wide, so the default 2048 × 2048 window fits over the whole focus range with some margin for lens mounting offsets.
+
+**TIFF layout.** One image with `SamplesPerPixel` = number of bands, planar configuration *separate*, photometric *minisblack*. The earlier layout (one page per band) is available as `tiff_layout: multipage`; GDAL-based tools see only the first band of such a file.
+
+**Tags.** `Make`, `Model`, `Software`, `DateTime` (acquisition time from EXIF), `ImageDescription` (the full metadata record as JSON), TIFF/EP `FocalLength` (37386) and `FocalPlaneXResolution` / `FocalPlaneYResolution` / `FocalPlaneResolutionUnit` (37390–37392, pixels per cm), `GDAL_METADATA` (42112) with dataset items (`CAMERA_MODEL`, `LENS`, `FOCAL_LENGTH_MM`, `PIXEL_SIZE_UM`, …) and per-band items (`DESCRIPTION` with role *description*, `CENTRAL_WAVELENGTH_UM` and `FWHM_UM` in the `IMAGERY` domain, `wavelength`, `fwhm`, `LENS`, `SENSOR_CHANNEL`), and `GDAL_NODATA` (42113) only when padding occurred.
+
+**EXIF.** Read with tifffile from TIFF-based files (TIFF, ARW, DNG, NEF, CR2, PEF, SRW) and from the APP1 block of JPEGs. Formats with another container (CR3, RAF, ORF, RW2) are processed normally but give no EXIF; configure the camera fields for them.
+
 ## Geometric model
 
 The exported product currently uses global translational displacement (`dx`, `dy`) for each lens image. The pipeline does not apply dense optical flow, local mesh deformation or non-rigid warping.

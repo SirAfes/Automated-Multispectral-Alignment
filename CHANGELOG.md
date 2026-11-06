@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.1.0
+
+### Added
+
+- Camera, band and processing metadata in every TIFF: make / model from the source EXIF; lens, effective focal length, pixel size and band width from the `camera` settings (defaults: Agrowing Sextuple, 21.8 mm, 3.76 µm, 30 nm); band names, centre wavelengths and FWHM as GDAL band metadata; alignment mode, lens shifts and crop origin as JSON in ImageDescription and in a `_metadata.json` sidecar.
+- Fixed output size for every image (`output_size_px`, default 2048 x 2048 for the reference camera), placed at the centre of the shared lens area or at a fixed position (`output_anchor`). The crop origin is recorded in reference-lens and source-image pixels in the metadata, quality report and run summary.
+- Optional lossless deflate compression (`tiff_compression`).
+
+### Changed
+
+- The TIFF is one multiband image instead of one page per band, so GDAL / QGIS / rasterio / ENVI read all bands with their wavelengths. `tiff_layout: multipage` restores the previous layout.
+- Bands are cut directly from the lens images (exact for whole-pixel shifts) instead of shifting full copies of every lens image.
+
 ## 1.0.0 — first public release
 
 ### Added

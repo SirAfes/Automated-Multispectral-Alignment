@@ -17,6 +17,20 @@
   "output_order": ["405", "430", "450", "490", "525", "550", "560", "570",
                    "630", "650", "685", "710", "735", "850"],
 
+  "camera": {
+    "make": null,
+    "model": null,
+    "lens": "Agrowing Sextuple",
+    "focal_length_mm": 21.8,
+    "pixel_size_um": 3.76,
+    "band_fwhm_nm": 30
+  },
+
+  "output_size_px": [2048, 2048],
+  "output_anchor": "common_area_center",
+  "tiff_layout": "multiband",
+  "tiff_compression": "none",
+
   "parallax_range_px": [20, 360],
 
   "closure_check": "reject",

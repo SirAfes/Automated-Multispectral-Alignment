@@ -39,7 +39,8 @@ from .image_io import (
 from .layout import layout_from_settings
 from .matching import PreparedImages
 from .settings import file_bands_int, load_settings
-from .split import save_split_cells, split_compound_array
+from .metadata import read_source_exif
+from .split import load_split_info, save_split_cells, split_compound_array
 from .stack import (
     build_alignment_priors,
     export_aligned_tiff,
@@ -208,6 +209,8 @@ def _finish(input_path, paths, export_result, settings, status_callback):
         "closure_max_residual": summary.get("closure_max_residual"),
         "alignment": alignment,
         "split_info": export_result.get("split_info", {}),
+        "output": export_result.get("output", {}),
+        "metadata_json": export_result.get("metadata_json", ""),
         "history_retry_used": bool(alignment.get("history_retry_used", False)),
         "batch_consensus_used": alignment.get("mode") == "batch_consensus",
     }
@@ -234,11 +237,12 @@ def process_single_file(
     if reuse_split and find_split_set(paths["split_dir"], split_ext, layout.count):
         if status_callback:
             status_callback("Using existing lens images")
+        split_info = load_split_info(paths["split_dir"])
     else:
         if status_callback:
             status_callback(f"Splitting compound image into {layout.count} lens images")
         images, split_info = split_compound_array(read_image(input_path), **_split_kwargs(settings))
-        save_split_cells(images, paths["split_dir"], split_ext, settings["jpeg_quality"])
+        save_split_cells(images, paths["split_dir"], split_ext, settings["jpeg_quality"], info=split_info)
 
     if images is None:
         images = load_split_images(paths["split_dir"], split_ext, layout.count)
@@ -253,6 +257,8 @@ def process_single_file(
         output_order=settings["output_order"],
         split_info=split_info,
         settings=settings,
+        source_path=input_path,
+        exif=read_source_exif(input_path),
     )
     return _finish(input_path, paths, export_result, settings, status_callback)
 
@@ -308,7 +314,8 @@ def process_with_consensus(
 
     if settings["batch_keep_split_images"]:
         save_split_cells(
-            images, paths["split_dir"], split_ext_for_input(input_path), settings["jpeg_quality"]
+            images, paths["split_dir"], split_ext_for_input(input_path), settings["jpeg_quality"],
+            info=split_info,
         )
 
     export_result = export_aligned_tiff(
@@ -319,6 +326,9 @@ def process_with_consensus(
         file_bands=file_bands_int(settings),
         output_order=settings["output_order"],
         split_info=split_info,
+        settings=settings,
+        source_path=input_path,
+        exif=read_source_exif(input_path),
     )
     return _finish(input_path, paths, export_result, settings, status_callback)
 
@@ -329,7 +339,8 @@ def process_with_consensus(
 
 SUMMARY_FIELDS = [
     "index", "file", "status", "mode", "quality", "closure", "closure_max_residual_px",
-    "batch_consensus", "history_retry", "second_pass", "seconds", "tiff", "error",
+    "batch_consensus", "history_retry", "second_pass", "seconds",
+    "width", "height", "origin_x", "origin_y", "padded_px", "tiff", "error",
 ]
 
 
@@ -416,6 +427,7 @@ class _Run:
             kind = event[0]
             if kind == "success":
                 _, index, result, elapsed, recovered = event
+                out = result.get("output") or {}
                 self.run_files.row(
                     index=index + 1, file=self.paths[index].name, status="success",
                     mode=result["alignment"].get("mode", ""), quality=result.get("quality", ""),
@@ -424,6 +436,10 @@ class _Run:
                     batch_consensus=result.get("batch_consensus_used", False),
                     history_retry=result.get("history_retry_used", False),
                     second_pass=recovered, seconds=round(elapsed, 1), tiff=result.get("tiff", ""),
+                    width=out.get("width", ""), height=out.get("height", ""),
+                    origin_x=(out.get("origin_in_reference_lens_px") or ["", ""])[0],
+                    origin_y=(out.get("origin_in_reference_lens_px") or ["", ""])[1],
+                    padded_px=out.get("padded_pixels", ""),
                 )
             elif kind == "final_error":
                 _, index, error, elapsed = event

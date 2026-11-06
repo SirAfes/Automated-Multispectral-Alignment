@@ -22,7 +22,7 @@ The reference configuration is a 3 × 2 six-lens camera with 14 bands from 405 t
 
 - [Installation](#installation)
 - [Usage](#usage)
-- [Outputs](#outputs)
+- [Outputs](#outputs) · [Metadata](#metadata)
 - [Configuration](#configuration)
 - [How it works](#how-it-works)
 - [Validation and responsible use](#validation-and-responsible-use)
@@ -83,6 +83,7 @@ D:/survey/
 ├── DSC06664_ARW/
 │   ├── split_lens_images/1.tif … 6.tif
 │   ├── DSC06664_ARW_aligned_multiband.tif                    ← aligned bands
+│   ├── DSC06664_ARW_aligned_multiband_metadata.json          ← camera, bands, crop
 │   ├── DSC06664_ARW_aligned_multiband_alignment_quality.txt  ← quality report
 │   └── DSC06664_ARW_aligned_multiband_alignment_quality.csv
 ├── tiff/
@@ -92,7 +93,8 @@ D:/survey/
     └── 20261105_141502_summary.csv                           ← one row per image
 ```
 
-- **Multiband TIFF:** one page per band, in the configured wavelength order, each page tagged with its band name. 8-bit for JPG input, 16-bit for RAW input.
+- **Multiband TIFF:** one image with all bands in the configured wavelength order, the same size for every image (2048 × 2048 px for the reference camera). 8-bit for JPG input, 16-bit for RAW input. GDAL, QGIS, rasterio and ENVI read it as one multiband raster.
+- **Metadata in the TIFF:** camera make and model, lens, focal length and pixel size; for every band its name (`405 nm`), centre wavelength, band width, lens and sensor channel; and the processing record (msalign version, alignment mode, lens shifts, crop position). See [Metadata](#metadata).
 - **`tiff/` folder:** a hard link by default — the same file under a second name, using no extra disk space. Can be switched to a real copy or off.
 - **Quality report:** for every lens pair the method, shift, support and confidence, plus the [closure check](#closure-check).
 - **Run summary:** status, alignment mode, quality and closure result of every image of a run, written as the run progresses.
@@ -108,6 +110,18 @@ RAW outputs carry the RAW extension in their name (`DSC06664_ARW`), so the RAW a
 
 RAW files are decoded with [rawpy](https://github.com/letmaik/rawpy) / LibRaw as close to the sensor data as possible: no white balance, no camera colour matrix, linear response, no automatic brightening. Each sensor channel stays a separate spectral measurement. For quantitative work, prefer RAW: camera JPGs are 8-bit, lossy, and their colour processing mixes the channels.
 
+## Metadata
+
+| Information | Where it comes from | Where it is written |
+|---|---|---|
+| Camera make, model, serial | EXIF of the source image | TIFF `Make` / `Model`, GDAL metadata, JSON |
+| Lens, focal length, pixel size | `camera` settings (EXIF if present) | TIFF/EP `FocalLength`, `FocalPlaneX/YResolution`, GDAL metadata, JSON |
+| Band name, centre wavelength, FWHM | `file_bands`, `output_order`, `camera.band_fwhm_nm` | GDAL band description and `CENTRAL_WAVELENGTH_UM` / `FWHM_UM`, JSON |
+| Acquisition date, exposure, ISO | EXIF | TIFF `DateTime`, JSON |
+| Alignment mode, lens shifts, crop origin | msalign | TIFF `ImageDescription` (JSON), sidecar JSON |
+
+Settings win over EXIF; anything that is neither configured nor in the EXIF is left out rather than guessed. The defaults describe the reference camera — Agrowing Sextuple lens (effective focal length 21.8 mm, 30 nm bands) on a Sony 61 MP body, whose EXIF supplies make and model. A configuration for another camera (different grid, cell size or bands) does not inherit these lens values.
+
 ## Configuration
 
 All settings have defaults for the reference camera. To change them, copy [`pipeline_config.example.json`](pipeline_config.example.json) to `pipeline_config.json` next to the `.exe` (or pass `--config FILE`) and keep only what you change. Unknown or inconsistent settings are rejected with a clear message at start-up. Every setting is documented in [`src/msalign/settings.py`](src/msalign/settings.py).
@@ -119,6 +133,11 @@ All settings have defaults for the reference camera. To change them, copy [`pipe
 | `center_crop_frac` | 0.80 | Centred part of each cell that is kept |
 | `file_bands` | reference camera | Band label in the R, G, B channel of each lens (`"0"` = unused) |
 | `output_order` | 405 … 850 | Band order in the output TIFF |
+| `camera` | Agrowing Sextuple | Lens, focal length, pixel size and band width written into the TIFF |
+| `output_size_px` | [2048, 2048] | Fixed output size; `null` = largest area all lenses share |
+| `output_anchor` | `common_area_center` | Position of the output window (see [Output size](#output-size)) |
+| `tiff_layout` | `multiband` | `multiband`, or `multipage` (one page per band, as before 1.1) |
+| `tiff_compression` | `none` | `none` or `deflate` (lossless, smaller files) |
 | `parallax_range_px` | [20, 360] | Expected shift between adjacent lenses along their baseline |
 | `closure_check` | `reject` | `reject`, `warn` or `off` |
 | `batch_threshold` | 50 | Number of images from which batch consensus mode is used |
@@ -167,6 +186,15 @@ The alignment measures only some lens pairs directly; all other relative shifts 
 
 A pair fails when the best local match is not at the implied shift, or when the implied shift has far weaker support than the other pairs of the same image. With `closure_check: reject` (default) a failed check sends the image to the next stage; with `warn` it is only reported and the quality is set to *low*. The report lists every checked pair with residual and correlation.
 
+### Output size
+
+After alignment, every image is cut to the same size. The cut happens **after** alignment and uses one window for all bands of an image, so it does not change the alignment between bands. Two placements are available:
+
+- `common_area_center` (default) — the window is centred on the area that all lenses share. Because that area depends on the subject distance, the window's origin can differ by a few pixels between images.
+- `fixed` — the window has the same origin in the reference lens for every image (centred on `output_fixed_center_px`), for pixel-to-pixel comparisons across a series.
+
+Either way the origin is recorded per image — in reference-lens pixels and in pixels of the full source image — in the metadata, the quality report and the run summary. If the shared area is smaller than the window, the image fails with a clear message instead of being padded, unless `output_max_padding_px` allows padding (padded pixels are 0 and marked as nodata).
+
 More detail: [Technical Notes](docs/TECHNICAL_NOTES.md).
 
 ## Validation and responsible use
@@ -198,6 +226,7 @@ src/msalign/
 ├── layout.py               lens array geometry
 ├── closure.py, matching.py closure check, bounded local matching
 ├── split.py, image_io.py   splitting, reading JPG/TIFF/RAW
+├── metadata.py             EXIF, camera / band / processing metadata
 └── settings.py             settings and validation
 build/                      PyInstaller build of the Windows executable
 docs/                       technical notes

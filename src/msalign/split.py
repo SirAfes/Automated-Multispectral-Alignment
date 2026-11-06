@@ -4,6 +4,7 @@ split.py
 Split a compound multi-lens image into cropped lens images (grid_cols x grid_rows).
 """
 
+import json
 import logging
 from pathlib import Path
 
@@ -15,21 +16,21 @@ from .image_io import read_image
 log = logging.getLogger(__name__)
 
 
-def center_crop(img, frac: float):
-    h, w = img.shape[:2]
-    ch = int(h * frac)
-    cw = int(w * frac)
-
+def _center_box(h, w, ch, cw):
     y0 = (h - ch) // 2
     x0 = (w - cw) // 2
+    return x0, y0, cw, ch
 
+
+def center_crop(img, frac: float):
+    h, w = img.shape[:2]
+    x0, y0, cw, ch = _center_box(h, w, int(h * frac), int(w * frac))
     return img[y0:y0 + ch, x0:x0 + cw].copy()
 
 
 def center_crop_size(img, size: int):
     h, w = img.shape[:2]
-    y0 = (h - size) // 2
-    x0 = (w - size) // 2
+    x0, y0, _, _ = _center_box(h, w, size, size)
     return img[y0:y0 + size, x0:x0 + size].copy()
 
 
@@ -90,21 +91,30 @@ def split_compound_array(
         y_edges = [round(i * h / grid_rows) for i in range(grid_rows + 1)]
 
     cells = {}
+    origins = {}
     resized = False
+    scale = 1.0
     idx = 1
     for row in range(grid_rows):
         for col in range(grid_cols):
             cell = img[y_edges[row]:y_edges[row + 1], x_edges[col]:x_edges[col + 1]]
+            h_c, w_c = cell.shape[:2]
 
             if mode == "fixed_grid":
-                cell = center_crop(cell, center_crop_frac)
-            elif min(cell.shape[:2]) >= target_size:
-                cell = center_crop_size(cell, target_size)
+                bx, by, bw, bh = _center_box(h_c, w_c, int(h_c * center_crop_frac), int(w_c * center_crop_frac))
+                cell = cell[by:by + bh, bx:bx + bw]
+            elif min(h_c, w_c) >= target_size:
+                bx, by, bw, bh = _center_box(h_c, w_c, target_size, target_size)
+                cell = cell[by:by + bh, bx:bx + bw]
             else:
-                cell = center_crop(cell, center_crop_frac)
-                cell = cv2.resize(cell, (target_size, target_size), interpolation=cv2.INTER_AREA)
+                bx, by, bw, bh = _center_box(h_c, w_c, int(h_c * center_crop_frac), int(w_c * center_crop_frac))
+                cell = cv2.resize(cell[by:by + bh, bx:bx + bw], (target_size, target_size),
+                                  interpolation=cv2.INTER_AREA)
                 resized = True
+                scale = max(bw, bh) / target_size
 
+            # top-left of this lens image in the source (sensor) image
+            origins[idx] = [int(x_edges[col] + bx), int(y_edges[row] + by)]
             cells[idx] = np.ascontiguousarray(cell)
             idx += 1
 
@@ -115,6 +125,9 @@ def split_compound_array(
         "expected_height": int(expected_h),
         "split_mode": mode + ("_resized" if resized else ""),
         "lens_size": int(target_size),
+        # source pixels per lens-image pixel (1.0 = native resolution)
+        "lens_scale": round(float(scale), 6),
+        "lens_origins": {str(k): v for k, v in origins.items()},
     }
     if mode != "fixed_grid":
         log.warning(
@@ -124,14 +137,28 @@ def split_compound_array(
     return cells, info
 
 
-def save_split_cells(cells, output_dir: Path, save_ext: str = ".jpg", jpeg_quality: int = 100):
+SPLIT_INFO_NAME = "split_info.json"
+
+
+def save_split_cells(cells, output_dir: Path, save_ext: str = ".jpg", jpeg_quality: int = 100,
+                     info: dict | None = None):
     output_dir.mkdir(parents=True, exist_ok=True)
     saved = {}
     for idx, cell in cells.items():
         out_path = output_dir / f"{idx}{save_ext}"
         save_image(out_path, cell, jpeg_quality=jpeg_quality)
         saved[idx] = out_path
+    if info:
+        (output_dir / SPLIT_INFO_NAME).write_text(json.dumps(info, indent=2), encoding="utf-8")
     return saved
+
+
+def load_split_info(split_dir: Path) -> dict:
+    path = Path(split_dir) / SPLIT_INFO_NAME
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
 
 
 def split_compound_image(
@@ -166,4 +193,5 @@ def split_compound_image(
     )
     if info is not None:
         info.update(split_info)
-    return save_split_cells(cells, output_dir, save_ext=save_ext, jpeg_quality=jpeg_quality)
+    return save_split_cells(cells, output_dir, save_ext=save_ext, jpeg_quality=jpeg_quality,
+                            info=split_info)
