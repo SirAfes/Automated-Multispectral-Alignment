@@ -23,10 +23,10 @@ from rasterio.errors import NotGeoreferencedWarning
 from rasterio.windows import Window
 import tifffile
 
-from stack_core import OUTPUT_ORDER
+from tiff_metadata import DEFAULT_WAVELENGTHS_NM
 
 
-WAVELENGTHS_NM = tuple(int(value) for value in OUTPUT_ORDER)
+WAVELENGTHS_NM = DEFAULT_WAVELENGTHS_NM
 TIFF_EXTENSIONS = frozenset({".tif", ".tiff"})
 REPORT_COLUMNS = (
     "source", "destination", "layout", "original_width", "original_height",
