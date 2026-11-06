@@ -24,6 +24,7 @@ import tifffile
 from alignment_core import estimate_xy_v4, DEFAULT_CONFIG
 from image_io import find_split_set
 from alignment_plan_b import estimate_xy_plan_b
+from tiff_metadata import gdal_band_metadata_extratags
 
 
 FILE_BANDS = {
@@ -604,17 +605,27 @@ def export_multipage_tiff_from_split(
     if status_callback:
         status_callback("Writing aligned 14-band TIFF")
 
-    with tifffile.TiffWriter(str(output_tiff)) as tif:
+    # Export one 14-sample TIFF image rather than 14 independent TIFF pages.
+    # Metashape and GDAL can read the former as a single multispectral frame.
+    # The iterator avoids allocating an additional full 14-band image in RAM.
+    def iter_bands():
         for band_name in OUTPUT_ORDER:
             file_id, ch_idx = band_map[band_name]
-            band = warped[file_id][y0:y1, x0:x1, ch_idx]
+            yield np.ascontiguousarray(warped[file_id][y0:y1, x0:x1, ch_idx])
 
-            tif.write(
-                band,
-                photometric="minisblack",
-                contiguous=False,
-                metadata={"band_name": band_name},
-            )
+    with tifffile.TiffWriter(str(output_tiff)) as tif:
+        tif.write(
+            iter_bands(),
+            shape=(len(OUTPUT_ORDER), y1 - y0, x1 - x0),
+            dtype=images[1].dtype,
+            photometric="minisblack",
+            planarconfig="separate",
+            metadata=None,
+            software="Automated Multispectral Alignment",
+            extratags=gdal_band_metadata_extratags(
+                tuple(int(name) for name in OUTPUT_ORDER)
+            ),
+        )
 
     export_result = {
         "alignment": alignment_result,
