@@ -23,10 +23,12 @@ from rasterio.errors import NotGeoreferencedWarning
 from rasterio.windows import Window
 import tifffile
 
-from tiff_metadata import DEFAULT_WAVELENGTHS_NM
-
-
-WAVELENGTHS_NM = DEFAULT_WAVELENGTHS_NM
+# Nominal wavelength order for this specific Agrowing camera configuration.
+# Keep this script standalone so it also works when copied outside the repository.
+WAVELENGTHS_NM = (
+    405, 430, 450, 490, 525, 550, 560,
+    570, 630, 650, 685, 710, 735, 850,
+)
 TIFF_EXTENSIONS = frozenset({".tif", ".tiff"})
 REPORT_COLUMNS = (
     "source", "destination", "layout", "original_width", "original_height",
