@@ -96,6 +96,36 @@ RAW files are decoded with [rawpy](https://github.com/letmaik/rawpy) (LibRaw) as
 
 RAW outputs get the RAW extension in their name, so a RAW+JPG pair of the same shot does not overwrite each other — for example `DSC06664.ARW` produces `DSC06664_ARW/` and `DSC06664_ARW_aligned_multiband.tif`.
 
+## Preparing TIFFs for Agisoft Metashape
+
+**Two TIFF layouts are supported, but they are not interchangeable in Metashape.**
+
+- **Multilayer TIFF:** 14 separate grayscale TIFF pages (IFDs) in one file. This is the default alignment output and retains Metashape's multiple-layer / multi-camera import workflow.
+- **Multichannel TIFF:** one TIFF page containing 14 samples per pixel. This can be used as a multichannel multispectral image in Metashape, but it does not create 14 separate camera/layer entries.
+
+In the Metashape **Workflow > Add Folder** dialog, select **Multi-camera system** for the multilayer workflow. Under **Tools > Camera Calibration > Bands**, assign the proper **Layer index** to each sensor if Metashape does not assign them. For multichannel files, use **Set Primary Channel** instead. Do not confuse these two workflows.
+
+The alignment export and the crop tool preserve **nominal band wavelengths**, not measured reflectance. Camera model, focal length, pixel pitch, exposure metadata, sensor intrinsics, and reflectance calibration cannot be derived from wavelength names alone. The crop tool never invents those values.
+
+To center-crop all 14-layer TIFFs to the minimum common width and height **without resampling or changing the page layout**, install dependencies and run:
+
+```powershell
+python -m pip install -r requirements.txt
+python -m pip install rasterio
+python src/prepare_metashape_tiffs.py --input "D:\\data\\tiff" --output "D:\\data\\tiff_cropped" --dry-run
+python src/prepare_metashape_tiffs.py --input "D:\\data\\tiff" --output "D:\\data\\tiff_cropped"
+```
+
+If a previous crop script converted 14-page TIFFs into 14-sample single-page TIFFs, **restore the Metashape multilayer layout** with:
+
+```powershell
+python src/prepare_metashape_tiffs.py --input "D:\\data\\tiff_cropped" --output "D:\\data\\tiff_restored" --layout multilayer
+```
+
+The conversion restores 14 layer slots and original pixel values if all 14 bands survived the previous conversion. It does **not** restore metadata already lost by the previous conversion; use original alignment TIFFs as the preferred source.
+
+The tool writes `crop_report.csv`, refuses unsupported or inconsistent TIFF layouts, and never overwrites existing output files unless `--overwrite` is supplied. Each input image is inspected before output to determine the minimum common dimensions. Inputs remain untouched.
+
 The final TIFF contains 14 bands in wavelength order:
 
 `405, 430, 450, 490, 525, 550, 560, 570, 630, 650, 685, 710, 735, 850 nm`

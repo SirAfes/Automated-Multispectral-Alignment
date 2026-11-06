@@ -24,6 +24,7 @@ import tifffile
 from alignment_core import estimate_xy_v4, DEFAULT_CONFIG
 from image_io import find_split_set
 from alignment_plan_b import estimate_xy_plan_b
+from tiff_metadata import DEFAULT_WAVELENGTHS_NM
 
 
 FILE_BANDS = {
@@ -35,12 +36,7 @@ FILE_BANDS = {
     6: ("490", "0",   "735"),
 }
 
-OUTPUT_ORDER = [
-    "405", "430", "450", "490",
-    "525", "550", "560", "570",
-    "630", "650", "685", "710",
-    "735", "850",
-]
+OUTPUT_ORDER = [str(wavelength) for wavelength in DEFAULT_WAVELENGTHS_NM]
 
 # Stable pair geometry used by the 2/5-centered fallback layout.
 # Historical priors are kept separately for every physical lens pair.
@@ -604,16 +600,24 @@ def export_multipage_tiff_from_split(
     if status_callback:
         status_callback("Writing aligned 14-band TIFF")
 
+    # Each wavelength remains its own TIFF page. Metashape treats this
+    # multilayer layout as distinct layers in a multi-camera system.
+    # Do not merge pages into a single multichannel TIFF here.
     with tifffile.TiffWriter(str(output_tiff)) as tif:
         for band_name in OUTPUT_ORDER:
             file_id, ch_idx = band_map[band_name]
             band = warped[file_id][y0:y1, x0:x1, ch_idx]
-
             tif.write(
                 band,
                 photometric="minisblack",
                 contiguous=False,
-                metadata={"band_name": band_name},
+                software="Automated Multispectral Alignment",
+                metadata={
+                    "band_name": band_name,
+                    "wavelength_nm": int(band_name),
+                    "wavelength_unit": "nm",
+                    "radiometric_calibration": "not_applied",
+                },
             )
 
     export_result = {
