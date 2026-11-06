@@ -5,6 +5,8 @@ from __future__ import annotations
 import contextlib
 import io
 from pathlib import Path
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -58,6 +60,23 @@ def cli(*args):
 
 
 class TIFFLayoutTests(unittest.TestCase):
+    def test_preparation_script_runs_when_copied_alone(self):
+        with tempfile.TemporaryDirectory() as directory:
+            isolated_script = Path(directory) / "prepare_metashape_tiffs.py"
+            shutil.copy2(
+                Path(__file__).resolve().parents[1] / "src" / "prepare_metashape_tiffs.py",
+                isolated_script,
+            )
+            process = subprocess.run(
+                [sys.executable, str(isolated_script), "--help"],
+                cwd=directory,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(process.returncode, 0, process.stderr)
+            self.assertIn("--input", process.stdout)
+
     def test_legacy_crop_preserves_fourteen_layers(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
