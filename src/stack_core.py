@@ -24,7 +24,7 @@ import tifffile
 from alignment_core import estimate_xy_v4, DEFAULT_CONFIG
 from image_io import find_split_set
 from alignment_plan_b import estimate_xy_plan_b
-from tiff_metadata import gdal_band_metadata_extratags
+from tiff_metadata import DEFAULT_WAVELENGTHS_NM, gdal_band_metadata_extratags
 
 
 FILE_BANDS = {
@@ -36,12 +36,7 @@ FILE_BANDS = {
     6: ("490", "0",   "735"),
 }
 
-OUTPUT_ORDER = [
-    "405", "430", "450", "490",
-    "525", "550", "560", "570",
-    "630", "650", "685", "710",
-    "735", "850",
-]
+OUTPUT_ORDER = [str(wavelength) for wavelength in DEFAULT_WAVELENGTHS_NM]
 
 # Stable pair geometry used by the 2/5-centered fallback layout.
 # Historical priors are kept separately for every physical lens pair.
