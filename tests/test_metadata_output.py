@@ -125,7 +125,13 @@ def test_raw_output_is_16bit_with_metadata(tmp_path, fake_rawpy):
     src = write_fake_raw(tmp_path / "DSC0001.ARW", make_compound(1))
     tags, _, data = tags_of(process_single_file(src, settings=settings)["tiff"])
     assert data.dtype == np.uint16 and data.shape[0] == 14
-    assert json.loads(tags[270])["data_type"] == "uint16"
+    meta = json.loads(tags[270])
+    assert meta["data_type"] == "uint16"
+    assert meta["raw_decoding"]["demosaic"] == "linear"
+    assert fake_rawpy.calls[-1]["demosaic_algorithm"] == "LINEAR"
+
+    process_single_file(src, settings=make_settings(tmp_path, raw_demosaic="ahd"))
+    assert fake_rawpy.calls[-1]["demosaic_algorithm"] == "AHD"
 
 
 def test_legacy_multipage_layout(tmp_path):

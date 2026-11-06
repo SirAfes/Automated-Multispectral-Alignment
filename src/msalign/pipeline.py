@@ -241,7 +241,7 @@ def process_single_file(
     else:
         if status_callback:
             status_callback(f"Splitting compound image into {layout.count} lens images")
-        images, split_info = split_compound_array(read_image(input_path), **_split_kwargs(settings))
+        images, split_info = split_compound_array(read_image(input_path, settings["raw_demosaic"]), **_split_kwargs(settings))
         save_split_cells(images, paths["split_dir"], split_ext, settings["jpeg_quality"], info=split_info)
 
     if images is None:
@@ -288,7 +288,7 @@ def process_with_consensus(
 
     if status_callback:
         status_callback(f"Splitting compound image into {layout.count} lens images")
-    images, split_info = split_compound_array(read_image(input_path), **_split_kwargs(settings))
+    images, split_info = split_compound_array(read_image(input_path, settings["raw_demosaic"]), **_split_kwargs(settings))
 
     if status_callback:
         status_callback("Verifying batch lens geometry on this image")

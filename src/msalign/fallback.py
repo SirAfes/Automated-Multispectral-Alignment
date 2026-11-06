@@ -25,7 +25,6 @@ from .alignment import (
     border_crop,
     gradient_mag,
     suppress_center_cross,
-    ncc_score,
 )
 
 

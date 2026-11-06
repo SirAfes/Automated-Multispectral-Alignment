@@ -34,6 +34,12 @@ DEFAULT_SETTINGS = {
     "center_crop_frac": 0.80,
     "jpeg_quality": 100,
 
+    # --- Camera RAW decoding ----------------------------------------------
+    # "linear": bilinear demosaicing from same-colour neighbours only (keeps
+    # spectral bands separate); "ahd": LibRaw's default, correlation-based
+    # (sharper, but mixes information between bands). See image_io.py.
+    "raw_demosaic": "linear",
+
     # --- Alignment geometry -----------------------------------------------
     # Primary alignment: every lens directly against this lens.
     "primary_reference_lens": 1,
@@ -47,6 +53,19 @@ DEFAULT_SETTINGS = {
     "parallax_range_px": [20, 360],
     # Allowed shift across the baseline direction (px).
     "parallax_cross_px": 80,
+
+    # --- Local (depth-dependent) alignment -------------------------------------
+    # Measure the remaining misalignment on image tiles after the global
+    # alignment (reported per image; ~0.5 s).
+    "local_residual_check": True,
+    # Correct depth parallax with one disparity map shared by all lenses
+    # (close-range scenes with depth). Bands are then resampled (bilinear).
+    # Kept only if it measurably reduces the local residuals.
+    "parallax_correction": False,
+    # Largest extra parallax searched, in full-resolution px per lens step.
+    "parallax_search_px": 48,
+    # Write <name>_parallax.tif (disparity map) when the correction is applied.
+    "write_parallax_map": True,
 
     # --- Closure check --------------------------------------------------------
     # Adjacent lens pairs not measured directly are checked on the image.
@@ -258,6 +277,9 @@ def validate_settings(settings: dict) -> dict:
         lens = int(settings["cell_size"] * settings["center_crop_frac"])
         if max(size) > lens:
             raise ValueError(f"output_size_px {list(size)} is larger than a lens image ({lens} px)")
+
+    if settings["raw_demosaic"] not in {"linear", "ahd"}:
+        raise ValueError("raw_demosaic must be 'linear' or 'ahd'")
 
     if settings["output_anchor"] not in {"common_area_center", "fixed"}:
         raise ValueError("output_anchor must be 'common_area_center' or 'fixed'")

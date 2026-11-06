@@ -71,7 +71,7 @@ msalign --list-settings                        # show all settings and current v
 
 ### Large series
 
-From 50 images on, msalign uses **batch consensus mode** for series taken at the same distance: about 16 images spread over the series are aligned in full, their common lens geometry is learned, and every other image only *verifies and refines* that geometry on its own content. Frames that do not match are aligned in full as usual. In a synthetic test at 9504 × 6336 px, a full alignment took about 70 s and a verified consensus image about 1 s, with identical shifts. Details: [batch consensus mode](docs/TECHNICAL_NOTES.md#batch-consensus-mode).
+From 50 images on, msalign uses **batch consensus mode** for series taken at the same distance: about 16 images spread over the series are aligned in full, their common lens geometry is learned, and every other image only *verifies and refines* that geometry on its own content. Frames that do not match are aligned in full as usual. A full alignment takes about 2.5 s per 61 MP image (synthetic test, without RAW decoding) and a verified consensus image about 1 s. Details: [batch consensus mode](docs/TECHNICAL_NOTES.md#batch-consensus-mode).
 
 ## Outputs
 
@@ -138,6 +138,8 @@ All settings have defaults for the reference camera. To change them, copy [`pipe
 | `output_anchor` | `common_area_center` | Position of the output window (see [Output size](#output-size)) |
 | `tiff_layout` | `multiband` | `multiband`, or `multipage` (one page per band, as before 1.1) |
 | `tiff_compression` | `none` | `none` or `deflate` (lossless, smaller files) |
+| `parallax_correction` | `false` | Depth-dependent correction with a shared disparity map (see [Depth parallax](#depth-parallax)) |
+| `raw_demosaic` | `linear` | `linear` keeps spectral bands separate; `ahd` is LibRaw's default |
 | `parallax_range_px` | [20, 360] | Expected shift between adjacent lenses along their baseline |
 | `closure_check` | `reject` | `reject`, `warn` or `off` |
 | `batch_threshold` | 50 | Number of images from which batch consensus mode is used |
@@ -186,6 +188,14 @@ The alignment measures only some lens pairs directly; all other relative shifts 
 
 A pair fails when the best local match is not at the implied shift, or when the implied shift has far weaker support than the other pairs of the same image. With `closure_check: reject` (default) a failed check sends the image to the next stage; with `warn` it is only reported and the quality is set to *low*. The report lists every checked pair with residual and correlation.
 
+### Depth parallax
+
+One translation per lens is exact only for a flat scene. In close-range scenes, nearer surfaces have more parallax between the lenses than farther ones. Every image therefore gets a **local residual check**: the remaining misalignment of each lens is measured on image tiles and reported (median and 90th percentile, in px). The report suggests a correction when it is large.
+
+With `"parallax_correction": true`, msalign corrects it. The lenses form a small camera array on a regular grid, so the remaining displacement of every lens follows from **one disparity map shared by all lenses** times that lens's grid offset (multi-baseline stereo). The map is estimated by a plane sweep on gradient images, which works across spectral bands. Bands are then resampled (bilinear). The correction is kept only if the residual check measurably improves; otherwise the global alignment is kept. The disparity map is saved as `<name>_parallax.tif`.
+
+On a close-range Agrowing image (DSC05928, stone object with a raised block), it reduced the local misalignment from a median of 3.6 px and a worst lens 90th percentile of 25.7 px to 1.3 px and 4.8 px, at about 5 s extra per image.
+
 ### Output size
 
 After alignment, every image is cut to the same size. The cut happens **after** alignment and uses one window for all bands of an image, so it does not change the alignment between bands. Two placements are available:
@@ -200,7 +210,7 @@ More detail: [Technical Notes](docs/TECHNICAL_NOTES.md).
 ## Validation and responsible use
 
 - Inspect a representative subset visually before quantitative analysis, especially scenes with strong depth differences, moving subjects, little texture, occlusion or very different illumination between bands.
-- The geometric model is a global translation per lens. Close-range scenes with large depth variation can keep local parallax after alignment; msalign does not apply non-rigid warping.
+- By default the geometric model is a global translation per lens. Close-range scenes with depth keep local parallax unless `parallax_correction` is enabled; check the local residual line in the quality report. Occluded areas (visible from one lens but not another) cannot be aligned by any method and remain.
 - The reported quality is an **alignment** quality indicator, not a statement about the scientific content of the bands.
 - A failed alignment is intentionally preferred over silently accepting an unsupported one.
 
@@ -225,6 +235,7 @@ src/msalign/
 ├── fallback.py             directional patches, AKAZE, history-guided retry
 ├── layout.py               lens array geometry
 ├── closure.py, matching.py closure check, bounded local matching
+├── parallax.py             local residual check, depth parallax correction
 ├── split.py, image_io.py   splitting, reading JPG/TIFF/RAW
 ├── metadata.py             EXIF, camera / band / processing metadata
 └── settings.py             settings and validation

@@ -31,6 +31,10 @@
   "tiff_layout": "multiband",
   "tiff_compression": "none",
 
+  "raw_demosaic": "linear",
+  "local_residual_check": true,
+  "parallax_correction": false,
+
   "parallax_range_px": [20, 360],
 
   "closure_check": "reject",

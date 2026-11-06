@@ -12,6 +12,8 @@ import logging
 import cv2
 import numpy as np
 
+from .image_io import fast_percentiles
+
 log = logging.getLogger(__name__)
 
 
@@ -82,7 +84,7 @@ def to_gray_float(img):
 
     g = g.astype(np.float32)
 
-    p1, p99 = np.percentile(g, 1), np.percentile(g, 99)
+    p1, p99 = fast_percentiles(g, [1, 99])
     g = (g - p1) / (p99 - p1 + 1e-6)
     g = np.clip(g, 0, 1)
 
@@ -127,7 +129,7 @@ def gradient_mag(img_f):
     mag = cv2.magnitude(gx, gy)
     mag = cv2.GaussianBlur(mag, (0, 0), 1.0)
 
-    p1, p99 = np.percentile(mag, 1), np.percentile(mag, 99)
+    p1, p99 = fast_percentiles(mag, [1, 99])
     mag = (mag - p1) / (p99 - p1 + 1e-6)
     mag = np.clip(mag, 0, 1)
 
@@ -267,8 +269,55 @@ def choose_candidate_patches(ref_g, config=None):
 # =========================================================
 def local_search_ncc(ref_patch, mov_img, x0, y0, coarse_dx, coarse_dy, dx_max, dy_max, config=None):
     """
-    Perform a local NCC-based search around the coarse translation estimate for
-    a single reference patch.
+    Local NCC search around the coarse translation for one reference patch.
+
+    The zero-mean NCC of every candidate offset is computed in one
+    cv2.matchTemplate call (TM_CCOEFF_NORMED = the same score as ncc_score);
+    a small distance penalty from the coarse estimate is then applied and the
+    best candidate is returned. Equivalent to local_search_ncc_reference(),
+    about two orders of magnitude faster.
+    """
+    ph, pw = ref_patch.shape[:2]
+    h, w = mov_img.shape[:2]
+    dist_penalty = _cfg(config, "DIST_PENALTY_PER_PIXEL")
+    none = {"dx": None, "dy": None, "score": -1e9, "raw_ncc": -1e9, "dist_from_coarse": None}
+
+    # candidate integer offsets, exactly as the reference loop builds them
+    cand_x = np.array([int(round(coarse_dx + d)) for d in range(-dx_max, dx_max + 1)])
+    cand_y = np.array([int(round(coarse_dy + d)) for d in range(-dy_max, dy_max + 1)])
+    # keep only candidates whose patch lies inside the moving image
+    cand_x = cand_x[(x0 + cand_x >= 0) & (x0 + cand_x + pw <= w)]
+    cand_y = cand_y[(y0 + cand_y >= 0) & (y0 + cand_y + ph <= h)]
+    if cand_x.size == 0 or cand_y.size == 0:
+        return none
+
+    rx0, ry0 = x0 + int(cand_x[0]), y0 + int(cand_y[0])
+    region = mov_img[ry0:y0 + int(cand_y[-1]) + ph, rx0:x0 + int(cand_x[-1]) + pw]
+    ncc = cv2.matchTemplate(
+        np.ascontiguousarray(region, dtype=np.float32),
+        np.ascontiguousarray(ref_patch, dtype=np.float32),
+        cv2.TM_CCOEFF_NORMED,
+    )
+    # flat (zero-variance) windows give undefined NCC; treat them as no match
+    ncc = np.nan_to_num(ncc, nan=-1.0, posinf=-1.0, neginf=-1.0)
+
+    dist = np.hypot(cand_x[None, :] - coarse_dx, cand_y[:, None] - coarse_dy)
+    score = ncc - dist_penalty * dist
+    iy, ix = np.unravel_index(int(np.argmax(score)), score.shape)
+
+    return {
+        "dx": int(cand_x[ix]),
+        "dy": int(cand_y[iy]),
+        "score": float(score[iy, ix]),
+        "raw_ncc": float(ncc[iy, ix]),
+        "dist_from_coarse": float(dist[iy, ix]),
+    }
+
+
+def local_search_ncc_reference(ref_patch, mov_img, x0, y0, coarse_dx, coarse_dy, dx_max, dy_max, config=None):
+    """
+    Original brute-force implementation, kept as the reference for testing
+    local_search_ncc().
     """
     ph, pw = ref_patch.shape[:2]
     h, w = mov_img.shape[:2]

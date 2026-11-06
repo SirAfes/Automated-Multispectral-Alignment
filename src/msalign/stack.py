@@ -37,6 +37,8 @@ from .image_io import find_split_set
 from .layout import LensLayout, layout_from_settings
 from .matching import PreparedImages
 from .metadata import build_metadata, tiff_tags, write_sidecar
+from . import parallax
+from .parallax import _crop as parallax_crop
 from .settings import DEFAULT_SETTINGS, file_bands_int
 
 
@@ -459,6 +461,23 @@ def write_alignment_quality_report(output_tiff: Path, export_result):
         ca = out["common_area_in_reference_lens_px"]
         lines.append(f"Shared area of all lenses: {ca['width']}x{ca['height']} px at ({ca['x']}, {ca['y']})")
 
+    local = (export_result.get("output") or {}).get("local_alignment") or {}
+    if local:
+        if "before" in local:
+            b, a = local["before"], local["after"]
+            lines.append(
+                f"Parallax correction: {'applied' if local['parallax_applied'] else 'not applied'} "
+                f"({local['parallax_reason']}); local residual worst p90 {b['worst_p90_px']} -> "
+                f"{a['worst_p90_px']} px, median {b['median_px']} -> {a['median_px']} px"
+            )
+        else:
+            lines.append(
+                f"Local residual (tile check): median {local['median_px']} px, worst lens p90 "
+                f"{local['worst_p90_px']} px"
+                + ("  -> depth parallax likely; consider parallax_correction"
+                   if (local.get("worst_p90_px") or 0) > 6 else "")
+            )
+
     cam = export_result.get("camera") or {}
     if cam:
         lines.append(
@@ -595,6 +614,65 @@ def export_multipage_tiff_from_split(
         source_path=source_path,
         exif=exif,
     )
+
+
+def _local_alignment(images, shifts, band_map, output_order, layout, win, settings, status_callback):
+    """Local residual check and, if enabled, depth-dependent parallax correction."""
+    if not (settings["parallax_correction"] or settings["local_residual_check"]):
+        return {}
+
+    used = {}
+    for label in output_order:
+        lens, ch = band_map[label]
+        used.setdefault(lens, []).append(ch)
+    ref = layout.primary_reference
+    r0, c0 = layout.position(ref)
+    steps = {k: (layout.position(k)[1] - c0, layout.position(k)[0] - r0) for k in used}
+
+    crops = {}
+    for k, channels in used.items():
+        src = images[k]
+        planes = [src[:, :, ch] if src.ndim == 3 else src for ch in channels]
+        x = win["x"] - shifts[k]["dx"]
+        y = win["y"] - shifts[k]["dy"]
+        crops[k] = np.mean(
+            [parallax.normalise_crop(parallax_crop(pl, x, y, win["width"], win["height"])) for pl in planes],
+            axis=0,
+        ).astype(np.float32)
+
+    if not settings["parallax_correction"]:
+        residuals = parallax.check_only(crops, settings)
+        summary = parallax.summarise(residuals)
+        return {"mode": "check", "residuals": _clean_residuals(residuals), **summary}
+
+    if status_callback:
+        status_callback("Correcting depth parallax")
+    res = parallax.estimate_parallax(crops, steps, parallax.lens_pairs(layout, crops), settings)
+    out = {
+        "mode": "parallax_correction" if res["applied"] else "check",
+        "parallax_applied": res["applied"],
+        "parallax_reason": res["reason"],
+        "reliable_fraction": res["reliable_fraction"],
+        "residuals_before": _clean_residuals(res["before"]),
+        "residuals_after": _clean_residuals(res["after"]),
+        "before": parallax.summarise(res["before"]),
+        "after": parallax.summarise(res["after"]),
+    }
+    log.info(
+        "Parallax correction %s: worst local residual p90 %s -> %s px",
+        "applied" if res["applied"] else "not applied",
+        out["before"]["worst_p90_px"], out["after"]["worst_p90_px"],
+    )
+    if res["applied"]:
+        out["lens_offset_corrections_px"] = {str(k): [round(v[0], 2), round(v[1], 2)] for k, v in res["offsets"].items()}
+        d = res["delta"]
+        out["parallax_range_px_per_lens_step"] = [round(float(np.percentile(d, 2)), 2), round(float(np.percentile(d, 98)), 2)]
+        out["_correction"] = {"delta": d, "offsets": res["offsets"], "steps": steps}
+    return out
+
+
+def _clean_residuals(residuals):
+    return {str(k): {kk: vv for kk, vv in v.items() if kk != "offset"} for k, v in residuals.items()}
 
 
 def _quality_brief(alignment_result):
@@ -740,14 +818,32 @@ def export_aligned_tiff(
     ix0, ix1, iy0, iy1 = win["inner"]
     ox, oy = win["x"], win["y"]
     dtype = images[ref].dtype
+
+    local = _local_alignment(images, shifts, band_map, output_order, layout, win, settings, status_callback)
+    correction = local.pop("_correction", None)
+
     data = np.zeros((len(output_order), win["height"], win["width"]), dtype=dtype)
+    if correction is not None:
+        yy, xx = np.mgrid[0:win["height"], 0:win["width"]].astype(np.float32)
     for b, label in enumerate(output_order):
         lens, ch = band_map[label]
         dx, dy = shifts[lens]["dx"], shifts[lens]["dy"]
         src = images[lens]
         plane = src[:, :, ch] if src.ndim == 3 else src
-        # aligned(x, y) = lens(x - dx, y - dy)
-        data[b, iy0 - oy:iy1 - oy, ix0 - ox:ix1 - ox] = plane[iy0 - dy:iy1 - dy, ix0 - dx:ix1 - dx]
+        if correction is not None and lens != ref:
+            # aligned(p) = lens(p + origin - s_k + delta(p) * grid_step_k + c_k)
+            step = correction["steps"][lens]
+            cx, cy = correction["offsets"][lens]
+            delta = correction["delta"]
+            data[b] = cv2.remap(
+                plane,
+                (xx + (ox - dx + cx) + delta * step[0]).astype(np.float32),
+                (yy + (oy - dy + cy) + delta * step[1]).astype(np.float32),
+                cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+            )
+        else:
+            # aligned(x, y) = lens(x - dx, y - dy)
+            data[b, iy0 - oy:iy1 - oy, ix0 - ox:ix1 - ox] = plane[iy0 - dy:iy1 - dy, ix0 - dx:ix1 - dx]
 
     origins = split_info.get("lens_origins") or {}
     scale = float(split_info.get("lens_scale", 1.0))
@@ -764,6 +860,8 @@ def export_aligned_tiff(
         "padded_pixels": win["padded_pixels"],
         "shifts": shifts,
     }
+    if local:
+        output["local_alignment"] = local
     if str(ref) in origins:
         # ... and in the full source (sensor) image
         sx, sy = origins[str(ref)]
@@ -788,6 +886,16 @@ def export_aligned_tiff(
         quality=_quality_brief(alignment_result),
     )
     write_tiff(output_tiff, data, meta, output_order, settings)
+    if correction is not None and settings["write_parallax_map"]:
+        parallax_path = output_tiff.with_name(output_tiff.stem + "_parallax.tif")
+        tifffile.imwrite(
+            str(parallax_path), correction["delta"], photometric="minisblack", metadata=None,
+            description=(
+                "msalign parallax map: residual disparity in pixels per lens step "
+                "(relative to the depth fitted by the global alignment; larger = nearer)"
+            ),
+        )
+        output["local_alignment"]["parallax_map"] = parallax_path.name
     metadata_json = write_sidecar(output_tiff, meta) if settings["write_metadata_json"] else None
 
     output.pop("shifts")

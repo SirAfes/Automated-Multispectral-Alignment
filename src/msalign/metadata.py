@@ -234,7 +234,19 @@ def build_metadata(*, settings, source_path, exif, band_map, output_order, dtype
         },
         "split": split_info or {},
         "settings_source": settings.get("_source"),
+        "raw_decoding": _raw_decoding(source_path, settings),
     }
+
+
+def _raw_decoding(source_path, settings):
+    from .image_io import is_raw_file, raw_decode_params
+
+    if not source_path or not is_raw_file(source_path):
+        return None
+    params = raw_decode_params(settings.get("raw_demosaic", "linear"))
+    params["gamma"] = list(params["gamma"])
+    params["decoder"] = "LibRaw via rawpy"
+    return params
 
 
 # ---------------------------------------------------------------------------

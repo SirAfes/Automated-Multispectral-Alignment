@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.2.0
+
+### Added
+
+- Local residual check for every image: remaining misalignment per lens on image tiles, in the quality report and metadata, with a hint when depth parallax is large.
+- Optional depth parallax correction (`parallax_correction`): one disparity map shared by all lenses (multi-baseline stereo on gradient images), a constant sub-pixel correction per lens, applied only if it measurably improves alignment; disparity map saved as `_parallax.tif`. On a close-range Agrowing image: worst lens 90th-percentile residual 25.7 -> 4.8 px, median 3.6 -> 1.3 px.
+
+### Changed
+
+- RAW files are demosaiced bilinearly from same-colour neighbours (`raw_demosaic: linear`) instead of LibRaw's correlation-based AHD, which mixes information between spectral bands; `ahd` remains available.
+- LibRaw's per-image white-level adjustment is disabled, so all images of a series get the same scaling.
+
+### Performance
+
+- Primary alignment about 25x faster (one image: ~60 s -> ~2.5 s without RAW decoding): the local NCC search uses one `cv2.matchTemplate` per patch instead of one NumPy call per candidate offset, with identical results.
+
 ## 1.1.0
 
 ### Added

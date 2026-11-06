@@ -4,7 +4,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from conftest import CELL, SHIFTS, make_compound, physical_shifts, write_jpg
+from conftest import CELL, make_compound, physical_shifts, write_jpg
 from msalign.cli import main as cli_main
 from msalign.layout import LensLayout
 from msalign.pipeline import process_single_file, run_pipeline

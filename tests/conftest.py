@@ -65,6 +65,34 @@ def make_compound(seed, shifts=SHIFTS, cell=CELL, jitter=0, cols=3):
     return img / img.max()
 
 
+def make_compound_depth(seed, extra=8, shifts=SHIFTS, cell=CELL, cols=3, rect=(0.25, 0.3, 0.45, 0.4)):
+    """
+    Like make_compound, but a textured foreground block is nearer to the camera:
+    its parallax is `extra` px per lens step larger than the background's.
+    rect = (x, y, w, h) of the block as fractions of the lens image.
+    """
+    rng = np.random.default_rng(seed + 2000)
+    bg = make_scene(seed, cell + 400)
+    fg = make_scene(seed + 500, cell + 400)
+    rows = -(-len(shifts) // cols)
+    img = np.zeros((rows * cell, cols * cell, 3), np.float32)
+    pad = 200
+    fx, fy, fw, fh = (int(v * cell) for v in rect)
+    for i, (dx, dy) in enumerate(shifts):
+        r, c = divmod(i, cols)
+        view = bg[pad + dy: pad + dy + cell, pad + dx: pad + dx + cell].copy()
+        # foreground: scene point (X, Y) of the block appears shifted by the
+        # extra parallax of this lens's grid position
+        ex, ey = -c * extra, -r * extra
+        block = fg[pad + fy: pad + fy + fh, pad + fx: pad + fx + fw]
+        x0, y0 = fx - dx - ex, fy - dy - ey
+        x0c, y0c = max(x0, 0), max(y0, 0)
+        x1c, y1c = min(x0 + fw, cell), min(y0 + fh, cell)
+        view[y0c:y1c, x0c:x1c] = block[y0c - y0:y1c - y0, x0c - x0:x1c - x0]
+        img[r * cell:(r + 1) * cell, c * cell:(c + 1) * cell] = view * np.asarray(MIX[i % len(MIX)], np.float32)
+    return img / img.max()
+
+
 def write_jpg(path, img):
     # imencode + tofile: cv2.imwrite cannot write non-ASCII paths on Windows.
     ok, buf = cv2.imencode(".jpg", (img * 255).astype(np.uint8))
@@ -96,6 +124,10 @@ def fake_rawpy(monkeypatch):
     class ColorSpace:
         raw = "raw"
 
+    class DemosaicAlgorithm:
+        LINEAR = "LINEAR"
+        AHD = "AHD"
+
     class _Raw:
         def __init__(self, path):
             self.path = path
@@ -110,9 +142,13 @@ def fake_rawpy(monkeypatch):
             assert kw["output_bps"] == 16
             assert kw["gamma"] == (1, 1)
             assert kw["output_color"] == ColorSpace.raw
+            assert kw["adjust_maximum_thr"] == 0.0
+            module.calls.append(kw)
             return np.load(Path(self.path).read_text())
 
     module.ColorSpace = ColorSpace
+    module.DemosaicAlgorithm = DemosaicAlgorithm
+    module.calls = []
     module.imread = _Raw
     monkeypatch.setitem(sys.modules, "rawpy", module)
     return module

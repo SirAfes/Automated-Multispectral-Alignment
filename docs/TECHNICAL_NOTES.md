@@ -161,9 +161,53 @@ For the reference camera, the lens baseline (≈ 11.9 mm, one cell of 3168 px ×
 
 ## Geometric model
 
-The exported product currently uses global translational displacement (`dx`, `dy`) for each lens image. The pipeline does not apply dense optical flow, local mesh deformation or non-rigid warping.
+The global stage estimates one translation (`dx`, `dy`) per lens, which is exact for a flat scene. For scenes with depth, an optional second stage (`parallax.py`) adds a depth-dependent part.
 
-This keeps the transformation interpretable and avoids inventing local geometric corrections without strong evidence. Close-range scenes with substantial depth variation can still contain local parallax after a global translation.
+### Local residual check
+
+After the global alignment, each lens is compared with the mean of all other lenses (gradient magnitude, half resolution) on a grid of about 512 px tiles. Phase correlation per tile gives the remaining shift; the report states the median and the 90th percentile per lens. Tile sizes are kept even: `cv2.phaseCorrelate` reports a spurious (0.5, 0.5) px shift for odd sizes.
+
+### Depth parallax correction
+
+The lenses lie on a regular grid with equal spacing, so a scene point at depth *Z* is displaced between lenses in proportion to their grid offset and to 1/*Z*. After the global alignment (which fits one depth), the remaining displacement of lens *k* at pixel *p* is
+
+`r_k(p) = δ(p) · (Δcol_k, Δrow_k) + c_k`
+
+with one disparity map δ shared by all lenses and a small constant c_k per lens. This was checked on DSC05928 before implementing it: at the same tile, lens 5 (one column from lens 4) showed (−15.6, 2.0) px, lens 2 (one column, one row) (−18.5, 12.8) px and lens 3 (two columns, one row) (−33.0, 11.7) px — one value δ ≈ 15 px per lens step explains all three.
+
+Estimation (multi-baseline stereo; Okutomi & Kanade, 1993):
+
+1. Gradient-magnitude images of each lens (mean of its used channels) at 1/4 resolution.
+2. Plane sweep over δ in ± `parallax_search_px` (step 2 px full resolution): every lens is shifted by δ·(Δcol, Δrow), and the local NCC (≈ 36 px window) is averaged over adjacent lens pairs. Gradients make the cost usable across spectral bands; short baselines limit occlusion.
+3. Best δ per pixel with parabolic sub-step refinement; pixels with weak or edge-of-range peaks get no weight. Confidence-weighted Gaussian smoothing and a median filter fill and regularise the map.
+4. c_k from the median tile residual after step 3, then a second sweep with c_k.
+5. Bands are resampled from the lens images (bilinear, no overshoot) with `lens(p + origin − s_k + δ(p)·(Δcol_k, Δrow_k) + c_k)`.
+
+The correction is applied only if the worst lens's 90th-percentile residual drops by more than 0.5 px and the median does not increase. Otherwise the global alignment is kept and the report says so.
+
+Validation on DSC05928 (2350 × 2451 px output, all six lenses): median residual 3.6 → 1.3 px, worst lens 90th percentile 25.7 → 4.8 px; an independent check against the 550 nm band agreed (90th percentile 2.1–4.4 px after). Runtime about 5 s per image. Limits: areas occluded in some lenses cannot be aligned; very low-texture areas take the disparity of their surroundings.
+
+Related approaches: Tommaselli et al. (ISPRS Archives XLVIII-G-2025) register close-range multi-lens images pixel-wise via a DSM and orthoimages per band, reaching about 1.5 px, but require a rigorous camera calibration. MicaSense's band alignment uses one homography per band and notes it fails when depth parallax is significant.
+
+## RAW decoding
+
+RAW files are decoded with LibRaw (rawpy) with white balance off, no colour matrix, linear response, no auto-brightening and 16-bit output. Two further choices:
+
+- **Demosaicing:** `raw_demosaic: linear` (default) interpolates each sensor channel only from neighbours of the same colour. Correlation-based methods (AHD, LibRaw's default and the setting before 1.2) use the other channels to interpolate; for narrow-band data this carries noise and structure between spectral bands (Eskelinen & Hämäläinen, WHISPERS 2018: higher absolute error than bilinear on hyperspectral data).
+- **White level:** `adjust_maximum_thr = 0`. LibRaw otherwise lowers the white level per image from its content, which changes the digital scaling between images of a series.
+
+The decoding parameters are recorded in the metadata (`raw_decoding`).
+
+## Performance
+
+Measured on a 9504 × 6336 px synthetic compound image (one CPU core, without RAW decoding):
+
+| Stage | Before 1.2 | 1.2 |
+|---|---|---|
+| Primary alignment (5 pairs) | ~59 s | ~2 s |
+| Whole image | ~60 s | ~2.5 s |
+
+The primary method's local search evaluated its NCC with one NumPy call per candidate offset (≈ 230 000 calls per image). It now uses one `cv2.matchTemplate` (`TM_CCOEFF_NORMED`, the same zero-mean NCC) per patch; a test checks that both give identical shifts. Intensity percentiles for normalisation are taken from a regular pixel subsample.
 
 ## Band configuration (reference camera)
 
