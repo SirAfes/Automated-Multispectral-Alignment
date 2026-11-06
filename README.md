@@ -5,6 +5,10 @@
 
 **msalign** registers the lens images of **multi-lens (snapshot) multispectral cameras** and exports a spatially aligned multiband TIFF — automatically, without manual control points.
 
+[![Close-range Agrowing image: aligned composite, zoom before and after depth parallax correction, and disparity map](docs/images/dsc05928_parallax.jpg)](docs/TECHNICAL_NOTES.md#depth-parallax-correction)
+
+<sub>Agrowing Sextuple, close-range stone surface (DSC05928). Composite of 850 / 550 / 450 nm from three different lenses. With one shift per lens, the nearer foreground still shows colour fringes; the depth parallax correction removes them (worst lens 90th-percentile misalignment 25.7 → 4.8 px). Right: the estimated disparity map.</sub>
+
 A multi-lens camera records one compound photograph in which every lens, each behind its own filter, sees the scene from a slightly different position. Before the bands can be used together, the lens views must be split and brought onto one pixel grid. msalign does this for single photographs and for series of thousands, and it says how much each result can be trusted.
 
 ```text
