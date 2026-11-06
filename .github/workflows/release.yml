@@ -1,0 +1,153 @@
+name: Release
+
+# Push a version tag (e.g. `git tag v1.2.0 && git push origin v1.2.0`, or create
+# the tag in the GitHub "Releases" page) to build and publish a release:
+# Windows executable (ZIP), Python wheel and source archive, with the notes for
+# that version taken from CHANGELOG.md.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to (re)build the release for, e.g. v1.2.0'
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      version: ${{ steps.tag.outputs.version }}
+    steps:
+      - id: tag
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+      - name: Tag matches package version and changelog
+        run: |
+          V="${{ steps.tag.outputs.version }}"
+          grep -q "__version__ = \"$V\"" src/msalign/__init__.py || { echo "::error::src/msalign/__init__.py is not version $V"; exit 1; }
+          grep -q "^## $V" CHANGELOG.md || { echo "::error::CHANGELOG.md has no section '## $V'"; exit 1; }
+
+  test:
+    needs: check
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.check.outputs.tag }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-dev.txt
+      - run: python -m pytest -q tests
+
+  python-package:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.check.outputs.tag }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Build wheel and source archive
+        run: |
+          python -m pip install --upgrade build
+          python -m build
+      - name: Check the wheel installs and runs
+        run: |
+          python -m pip install dist/*.whl
+          msalign --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-package
+          path: dist/*
+
+  windows-exe:
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.check.outputs.tag }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-build.txt
+          python -c "import rawpy; print('rawpy', rawpy.__version__, 'LibRaw', rawpy.libraw_version)"
+      - name: Build executable
+        shell: pwsh
+        run: |
+          python -m PyInstaller --clean --noconfirm --distpath build-output --workpath build-work build/Automated_Multispectral_Alignment.spec
+      - name: Package
+        shell: pwsh
+        run: |
+          $name = "Automated_Multispectral_Alignment-${{ needs.check.outputs.version }}-windows"
+          New-Item -ItemType Directory $name | Out-Null
+          Copy-Item build-output/Automated_Multispectral_Alignment.exe, pipeline_config.example.json, README.md, LICENSE $name
+          Compress-Archive -Path $name -DestinationPath "$name.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-exe
+          path: '*-windows.zip'
+
+  publish:
+    needs: [check, python-package, windows-exe]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.check.outputs.tag }}
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+      - name: Release notes from CHANGELOG.md
+        run: |
+          V="${{ needs.check.outputs.version }}"
+          awk -v v="$V" '
+            $0 ~ "^## " v "([^0-9.]|$)" {on=1; next}
+            on && /^## / {exit}
+            on {print}
+          ' CHANGELOG.md > notes.md
+          {
+            echo
+            echo "### Install"
+            echo
+            echo "- **Windows:** download \`Automated_Multispectral_Alignment-$V-windows.zip\` below, extract it and run the \`.exe\`."
+            echo "- **Python 3.10+:** \`pip install https://github.com/${{ github.repository }}/releases/download/v$V/automated_multispectral_alignment-$V-py3-none-any.whl\`"
+          } >> notes.md
+          cat notes.md
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ needs.check.outputs.tag }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" assets/* --clobber
+            gh release edit "$TAG" --notes-file notes.md
+          else
+            gh release create "$TAG" assets/* --title "msalign ${{ needs.check.outputs.version }}" --notes-file notes.md
+          fi

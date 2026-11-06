@@ -5,6 +5,10 @@
 
 **msalign** registers the lens images of **multi-lens (snapshot) multispectral cameras** and exports a spatially aligned multiband TIFF — automatically, without manual control points.
 
+[![Close-range Agrowing image: aligned composite, zoom before and after depth parallax correction, and disparity map](docs/images/dsc05928_parallax.jpg)](docs/TECHNICAL_NOTES.md#depth-parallax-correction)
+
+<sub>Agrowing Sextuple, close-range stone surface (DSC05928). Composite of 850 / 550 / 450 nm from three different lenses. With one shift per lens, the nearer foreground still shows colour fringes; the depth parallax correction removes them (worst lens 90th-percentile misalignment 25.7 → 4.8 px). Right: the estimated disparity map.</sub>
+
 A multi-lens camera records one compound photograph in which every lens, each behind its own filter, sees the scene from a slightly different position. Before the bands can be used together, the lens views must be split and brought onto one pixel grid. msalign does this for single photographs and for series of thousands, and it says how much each result can be trusted.
 
 ```text
@@ -33,11 +37,11 @@ The reference configuration is a 3 × 2 six-lens camera with 14 bands from 405 t
 
 ### Windows — no Python required
 
-1. Open the **Actions** tab of this repository and choose **Build Windows executable**.
-2. Open the latest successful run and download **Automated-Multispectral-Alignment-Windows** under *Artifacts*.
+1. Open the [latest release](https://github.com/SirAfes/Automated-Multispectral-Alignment/releases/latest).
+2. Download `Automated_Multispectral_Alignment-<version>-windows.zip`.
 3. Extract the ZIP and run `Automated_Multispectral_Alignment.exe`.
 
-> Windows may warn about an unsigned executable downloaded from the internet. The artifact is built by GitHub Actions directly from the source in this repository.
+> Windows may warn about an unsigned executable downloaded from the internet. Release files are built by GitHub Actions directly from the tagged source in this repository.
 
 ### Python (Windows, macOS, Linux)
 
@@ -46,6 +50,8 @@ Python 3.10 or newer:
 ```bash
 python -m pip install "git+https://github.com/SirAfes/Automated-Multispectral-Alignment.git"
 ```
+
+(or install the `.whl` file attached to a [release](https://github.com/SirAfes/Automated-Multispectral-Alignment/releases)).
 
 This installs two commands: `msalign` (command line) and `msalign-gui` (desktop app).
 

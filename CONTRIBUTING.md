@@ -29,3 +29,10 @@ python -m pytest
 - Use `logging` (`log = logging.getLogger(__name__)`), not `print`.
 
 CI runs the tests on Windows and Linux for every push and pull request.
+
+## Releasing
+
+1. Update `__version__` in `src/msalign/__init__.py`, `version` in `CITATION.cff`, and add a `## <version>` section to `CHANGELOG.md`.
+2. Merge to `main`, then create the tag `v<version>` (on the Releases page, or `git tag v<version> && git push origin v<version>`).
+3. The **Release** workflow tests the tagged code, builds the Windows ZIP, the wheel and the source archive, and publishes them as a GitHub Release with the changelog section as notes.
+
