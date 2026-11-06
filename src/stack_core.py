@@ -24,7 +24,7 @@ import tifffile
 from alignment_core import estimate_xy_v4, DEFAULT_CONFIG
 from image_io import find_split_set
 from alignment_plan_b import estimate_xy_plan_b
-from tiff_metadata import DEFAULT_WAVELENGTHS_NM, gdal_band_metadata_extratags
+from tiff_metadata import DEFAULT_WAVELENGTHS_NM
 
 
 FILE_BANDS = {
@@ -600,27 +600,25 @@ def export_multipage_tiff_from_split(
     if status_callback:
         status_callback("Writing aligned 14-band TIFF")
 
-    # Export one 14-sample TIFF image rather than 14 independent TIFF pages.
-    # Metashape and GDAL can read the former as a single multispectral frame.
-    # The iterator avoids allocating an additional full 14-band image in RAM.
-    def iter_bands():
+    # Each wavelength remains its own TIFF page. Metashape treats this
+    # multilayer layout as distinct layers in a multi-camera system.
+    # Do not merge pages into a single multichannel TIFF here.
+    with tifffile.TiffWriter(str(output_tiff)) as tif:
         for band_name in OUTPUT_ORDER:
             file_id, ch_idx = band_map[band_name]
-            yield np.ascontiguousarray(warped[file_id][y0:y1, x0:x1, ch_idx])
-
-    with tifffile.TiffWriter(str(output_tiff)) as tif:
-        tif.write(
-            iter_bands(),
-            shape=(len(OUTPUT_ORDER), y1 - y0, x1 - x0),
-            dtype=images[1].dtype,
-            photometric="minisblack",
-            planarconfig="separate",
-            metadata=None,
-            software="Automated Multispectral Alignment",
-            extratags=gdal_band_metadata_extratags(
-                tuple(int(name) for name in OUTPUT_ORDER)
-            ),
-        )
+            band = warped[file_id][y0:y1, x0:x1, ch_idx]
+            tif.write(
+                band,
+                photometric="minisblack",
+                contiguous=False,
+                software="Automated Multispectral Alignment",
+                metadata={
+                    "band_name": band_name,
+                    "wavelength_nm": int(band_name),
+                    "wavelength_unit": "nm",
+                    "radiometric_calibration": "not_applied",
+                },
+            )
 
     export_result = {
         "alignment": alignment_result,
