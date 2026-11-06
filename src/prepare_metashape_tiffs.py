@@ -55,6 +55,10 @@ def arguments(argv=None):
     parser.add_argument("--overwrite", action="store_true", help="Replace output files")
     parser.add_argument("--chunk-rows", type=int, default=128, help="Streaming rows per block")
     parser.add_argument(
+        "--layout", choices=("preserve", "multilayer"), default="preserve",
+        help="Preserve input TIFF layout, or write 14 grayscale pages for Metashape multi-camera",
+    )
+    parser.add_argument(
         "--wavelengths-nm", type=str, default=",".join(map(str, WAVELENGTHS_NM)),
         help="Comma-separated band wavelengths in file order (default: project band map)",
     )
@@ -147,6 +151,13 @@ def inspect(path: Path, wavelengths: tuple[int, ...]) -> ImageInfo:
                 raise ValueError(
                     f"GCP/RPC referencing requires special handling: {path.name}"
                 )
+            if layout == "legacy_14_page" and (
+                src.crs is not None or not src.transform.is_identity
+            ):
+                raise ValueError(
+                    f"Georeferenced legacy multipage TIFF needs a dedicated "
+                    f"per-page geotransform-preserving workflow: {path.name}"
+                )
     return ImageInfo(path, width, height, str(dtype), layout)
 
 
@@ -170,6 +181,82 @@ def crop_box(info: ImageInfo, target_width: int, target_height: int) -> dict[str
     }
 
 
+def write_multilayer(
+    info: ImageInfo,
+    destination: Path,
+    left: int,
+    top: int,
+    width: int,
+    height: int,
+    wavelengths: tuple[int, ...],
+    args,
+) -> None:
+    """Write exactly 14 grayscale IFDs, retaining the Metashape layer layout."""
+    with tifffile.TiffWriter(str(destination)) as writer:
+        if info.layout == "legacy_14_page":
+            with tifffile.TiffFile(info.path) as source:
+                for index, (page, wavelength) in enumerate(
+                    zip(source.pages, wavelengths), start=1
+                ):
+                    original_metadata = {}
+                    try:
+                        existing = json.loads(page.description or "{}")
+                        if isinstance(existing, dict):
+                            original_metadata = existing
+                    except (TypeError, ValueError):
+                        pass
+                    metadata = {
+                        **original_metadata,
+                        "band_name": str(wavelength),
+                        "wavelength_nm": wavelength,
+                        "wavelength_unit": "nm",
+                    }
+                    if args.camera_model:
+                        metadata["camera_model"] = args.camera_model
+                    if args.focal_length_mm is not None:
+                        metadata["focal_length_mm"] = args.focal_length_mm
+                    if args.pixel_size_um is not None:
+                        metadata["pixel_size_um"] = args.pixel_size_um
+                    image = page.asarray()
+                    writer.write(
+                        np.ascontiguousarray(image[top:top + height, left:left + width]),
+                        photometric="minisblack",
+                        metadata=metadata,
+                        contiguous=False,
+                    )
+        else:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", NotGeoreferencedWarning)
+                with rasterio.open(info.path) as source:
+                    if source.crs is not None or not source.transform.is_identity:
+                        raise ValueError(
+                            "Converting georeferenced multichannel TIFF to multilayer "
+                            "requires preservation of page-level spatial tags."
+                        )
+                    for index, wavelength in enumerate(wavelengths, start=1):
+                        image = source.read(
+                            index,
+                            window=Window(left, top, width, height),
+                        )
+                        metadata = {
+                            "band_name": str(wavelength),
+                            "wavelength_nm": wavelength,
+                            "wavelength_unit": "nm",
+                        }
+                        if args.camera_model:
+                            metadata["camera_model"] = args.camera_model
+                        if args.focal_length_mm is not None:
+                            metadata["focal_length_mm"] = args.focal_length_mm
+                        if args.pixel_size_um is not None:
+                            metadata["pixel_size_um"] = args.pixel_size_um
+                        writer.write(
+                            image,
+                            photometric="minisblack",
+                            metadata=metadata,
+                            contiguous=False,
+                        )
+
+
 def write_one(
     info: ImageInfo,
     destination: Path,
@@ -183,6 +270,18 @@ def write_one(
     width, height = crop["target_width"], crop["target_height"]
 
     try:
+        if info.layout == "legacy_14_page" or args.layout == "multilayer":
+            write_multilayer(
+                info, temporary, left, top, width, height, wavelengths, args
+            )
+            with tifffile.TiffFile(temporary) as check:
+                if len(check.pages) != 14 or any(
+                    page.shape != (height, width) for page in check.pages
+                ):
+                    raise IOError("Multilayer TIFF validation failed.")
+            os.replace(temporary, destination)
+            return
+
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", NotGeoreferencedWarning)
             with rasterio.open(info.path) as src:
@@ -238,30 +337,20 @@ def write_one(
                                 WAVELENGTH_UNITS="nm",
                             )
 
-                        if info.layout == "legacy_14_page":
-                            with tifffile.TiffFile(info.path) as tif:
-                                for index, page in enumerate(tif.pages, start=1):
-                                    band = page.asarray()
-                                    dst.write(band[top:top + height, left:left + width], index)
-                        else:
-                            for row in range(0, height, args.chunk_rows):
-                                rows = min(args.chunk_rows, height - row)
-                                src_window = Window(left, top + row, width, rows)
-                                dst_window = Window(0, row, width, rows)
-                                dst.write(src.read(window=src_window), window=dst_window)
+                        for row in range(0, height, args.chunk_rows):
+                            rows = min(args.chunk_rows, height - row)
+                            src_window = Window(left, top + row, width, rows)
+                            dst_window = Window(0, row, width, rows)
+                            dst.write(src.read(window=src_window), window=dst_window)
 
                             if any(
                                 MaskFlags.per_dataset in flags
                                 for flags in src.mask_flag_enums
                             ):
-                                for row in range(0, height, args.chunk_rows):
-                                    rows = min(args.chunk_rows, height - row)
-                                    dst.write_mask(
-                                        src.dataset_mask(
-                                            window=Window(left, top + row, width, rows)
-                                        ),
-                                        window=Window(0, row, width, rows),
-                                    )
+                                dst.write_mask(
+                                    src.dataset_mask(window=src_window),
+                                    window=dst_window,
+                                )
 
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", NotGeoreferencedWarning)
