@@ -5,6 +5,12 @@ from __future__ import annotations
 from xml.etree.ElementTree import Element, SubElement, tostring
 
 
+DEFAULT_WAVELENGTHS_NM = (
+    405, 430, 450, 490, 525, 550, 560,
+    570, 630, 650, 685, 710, 735, 850,
+)
+
+
 def gdal_band_metadata_extratags(wavelengths_nm: list[int] | tuple[int, ...]):
     """Return a TIFF GDALMetadata tag containing per-sample wavelength labels.
 
