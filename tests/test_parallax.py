@@ -73,7 +73,7 @@ def test_parallax_correction_aligns_the_nearer_block(tmp_path):
     h, w = pmap.shape
     inside = np.median(pmap[int(h * 0.35):int(h * 0.5), int(w * 0.30):int(w * 0.5)])
     outside = np.median(pmap[int(h * 0.8):, int(w * 0.8):])
-    assert abs(abs(inside - outside) - extra) < 2.5
+    assert abs((inside - outside) - extra) < 2.5  # larger values = nearer surfaces
 
     meta = json.loads(Path(on["metadata_json"]).read_text())
     assert meta["output"]["local_alignment"]["parallax_applied"] is True
