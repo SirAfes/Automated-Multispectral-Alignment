@@ -17,10 +17,10 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.13'
 
@@ -53,7 +53,7 @@ jobs:
           if ($p.ExitCode -ne 0) { Write-Error "Executable self-test failed (exit $($p.ExitCode))"; exit 1 }
 
       - name: Upload executable
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: Automated-Multispectral-Alignment-Windows
           path: |
