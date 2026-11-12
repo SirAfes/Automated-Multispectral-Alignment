@@ -1,16 +1,27 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+import os
+import sys
+
 from PyInstaller.utils.hooks import collect_dynamic_libs, collect_submodules
 
+# Paths in pathex are resolved from the working directory, not from this
+# file, so build an absolute path to src/ (SPECPATH = folder of this spec).
+SRC = os.path.abspath(os.path.join(SPECPATH, '..', 'src'))
+sys.path.insert(0, SRC)
+
 hiddenimports = (
-    collect_submodules('cv2')
+    collect_submodules('msalign')
+    + collect_submodules('cv2')
     + collect_submodules('tifffile')
     + collect_submodules('rawpy')
 )
+if not any(name.startswith('msalign.') for name in hiddenimports):
+    raise SystemExit(f'msalign package not found in {SRC}')
 
 a = Analysis(
     ['launch_gui.py'],
-    pathex=['../src'],
+    pathex=[SRC],
     binaries=collect_dynamic_libs('rawpy'),
     datas=[],
     hiddenimports=hiddenimports,
