@@ -99,6 +99,13 @@ jobs:
         shell: pwsh
         run: |
           python -m PyInstaller --clean --noconfirm --distpath build-output --workpath build-work build/Automated_Multispectral_Alignment.spec
+      - name: Self-test the executable
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath build-output/Automated_Multispectral_Alignment.exe -ArgumentList '--self-test','selftest.txt' -Wait -PassThru
+          Get-Content selftest.txt
+          if ($p.ExitCode -ne 0) { Write-Error "Executable self-test failed (exit $($p.ExitCode))"; exit 1 }
+
       - name: Package
         shell: pwsh
         run: |
