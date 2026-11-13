@@ -488,6 +488,13 @@ class PipelineWindow:
             _, _log_path, summary_path = event
             self.summary_path = summary_path
 
+        elif kind == "workers":
+            _, count = event
+            if count > 1:
+                self.operation_label.configure(
+                    text=self.operation_label.cget("text") + f" · {count} at a time"
+                )
+
         elif kind in {"mode", "phase"}:
             _, text = event
             self.current_stage = text
@@ -628,6 +635,9 @@ def _choose_inputs(root: tk.Tk):
 
 
 def main():
+    import multiprocessing
+
+    multiprocessing.freeze_support()
     root = tk.Tk()
     root.withdraw()
 

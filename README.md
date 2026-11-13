@@ -116,6 +116,18 @@ RAW outputs carry the RAW extension in their name (`DSC06664_ARW`), so the RAW a
 
 RAW files are decoded with [rawpy](https://github.com/letmaik/rawpy) / LibRaw as close to the sensor data as possible: no white balance, no camera colour matrix, linear response, no automatic brightening. Each sensor channel stays a separate spectral measurement. For quantitative work, prefer RAW: camera JPGs are 8-bit, lossy, and their colour processing mixes the channels.
 
+### Other formats
+
+- **ENVI** (`"envi_export": true`): `<name>.img` + `<name>.hdr`, band sequential, with band names, wavelengths and FWHM — for ENVI, GDAL/QGIS and hyperspectral libraries such as Spectral Python.
+- **3D reconstruction / photogrammetry** (`"metashape_export": true`): the aligned TIFF is made for band analysis, not for 3D software. Its bands are shifted to match each other, so it is no longer one camera's projection. This export writes the *unaligned* lens images, one folder per band, so Agisoft Metashape (Workflow → Add Folder → *Multi-camera system*) treats every lens as a camera of a fixed rig and solves the geometry — including depth parallax — in 3D. The files carry focal length, pixel size and the XMP band/rig tags (BandName, CentralWavelength, WavelengthFWHM, RigName, RigCameraIndex, CaptureUUID). The folder also gets a `README.txt` with the steps and a `load_in_metashape.py` script for Metashape Pro.
+
+```text
+metashape/
+├── 01_405nm/DSC05928.tif  …  14_850nm/DSC05928.tif
+├── README.txt
+└── load_in_metashape.py
+```
+
 ## Metadata
 
 | Information | Where it comes from | Where it is written |
@@ -144,6 +156,9 @@ All settings have defaults for the reference camera. To change them, copy [`pipe
 | `output_anchor` | `common_area_center` | Position of the output window (see [Output size](#output-size)) |
 | `tiff_layout` | `multiband` | `multiband`, or `multipage` (one page per band, as before 1.1) |
 | `tiff_compression` | `none` | `none` or `deflate` (lossless, smaller files) |
+| `workers` | `auto` | Images processed at the same time (one per CPU core minus one, limited by free memory); `1` = one after the other |
+| `envi_export` | `false` | Also write the aligned stack as ENVI `.img` + `.hdr` |
+| `metashape_export` | `false` | Also write the unaligned lens images in a multi-camera layout for 3D software |
 | `parallax_correction` | `false` | Depth-dependent correction with a shared disparity map (see [Depth parallax](#depth-parallax)) |
 | `raw_demosaic` | `linear` | `linear` keeps spectral bands separate; `ahd` is LibRaw's default |
 | `parallax_range_px` | [20, 360] | Expected shift between adjacent lenses along their baseline |

@@ -65,6 +65,9 @@ def build_parser():
 
 
 def main(argv=None) -> int:
+    import multiprocessing
+
+    multiprocessing.freeze_support()
     # --list-settings works without inputs
     argv = sys.argv[1:] if argv is None else argv
     if "--list-settings" in argv:
