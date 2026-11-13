@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Parallel processing (`workers`, default `auto`): images are processed in separate processes, sized to CPU cores and free memory. First-pass results do not depend on processing order; if a worker process dies, the run continues one image at a time. 1.75x faster with two workers on two cores.
+
+### Fixed
+
+- Windows executable failed at start with "No module named 'msalign'" (since 1.0); the build now runs the executable's self-test.
+
 ## 1.2.0
 
 ### Added
