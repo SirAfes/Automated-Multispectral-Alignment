@@ -150,6 +150,13 @@ DEFAULT_SETTINGS = {
     "tiff_compression": "none",
     # Also write <name>_metadata.json next to the TIFF.
     "write_metadata_json": True,
+    # Also write the aligned stack as ENVI (<name>.img + .hdr, band sequential)
+    # with wavelengths, for ENVI and hyperspectral software.
+    "envi_export": False,
+    # Also write the UNALIGNED lens images, one folder per band, for 3D
+    # reconstruction in Agisoft Metashape and similar software (multi-camera
+    # rig layout, see exports.py). <source folder>/metashape/
+    "metashape_export": False,
 
     # --- Outputs ------------------------------------------------------------
     # Second copy of every final TIFF in <source folder>/tiff.

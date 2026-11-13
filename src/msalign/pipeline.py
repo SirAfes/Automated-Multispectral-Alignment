@@ -39,9 +39,11 @@ from .image_io import (
 from .layout import layout_from_settings
 from .matching import PreparedImages
 from .settings import file_bands_int, load_settings
+from .exports import RIG_DIR_NAME, write_rig_helpers, write_rig_images
 from .metadata import read_source_exif
 from .split import load_split_info, save_split_cells, split_compound_array
 from .stack import (
+    build_band_map,
     build_alignment_priors,
     export_aligned_tiff,
     export_multipage_tiff_from_split,
@@ -232,6 +234,7 @@ def process_single_file(
 
     log.info("=== Processing: %s ===", input_path.name)
 
+    exif = read_source_exif(input_path)
     images = None
     split_info = {}
     if reuse_split and find_split_set(paths["split_dir"], split_ext, layout.count):
@@ -243,6 +246,7 @@ def process_single_file(
             status_callback(f"Splitting compound image into {layout.count} lens images")
         images, split_info = split_compound_array(read_image(input_path, settings["raw_demosaic"]), **_split_kwargs(settings))
         save_split_cells(images, paths["split_dir"], split_ext, settings["jpeg_quality"], info=split_info)
+        _export_rig(images, input_path, settings, exif, status_callback)
 
     if images is None:
         images = load_split_images(paths["split_dir"], split_ext, layout.count)
@@ -258,9 +262,28 @@ def process_single_file(
         split_info=split_info,
         settings=settings,
         source_path=input_path,
-        exif=read_source_exif(input_path),
+        exif=exif,
     )
     return _finish(input_path, paths, export_result, settings, status_callback)
+
+
+def _export_rig(images, input_path, settings, exif, status_callback=None):
+    """Unaligned single-band lens images for photogrammetry (metashape_export)."""
+    if not settings["metashape_export"]:
+        return
+    if status_callback:
+        status_callback("Writing lens images for photogrammetry")
+    write_rig_images(
+        images, build_band_map(file_bands_int(settings)), settings["output_order"], settings,
+        input_path, output_name(input_path), exif,
+    )
+
+
+def nearest_band(output_order, target=550.0):
+    from .metadata import wavelength_nm
+
+    labelled = [(abs(wavelength_nm(b) - target), b) for b in output_order if wavelength_nm(b) is not None]
+    return min(labelled)[1] if labelled else output_order[0]
 
 
 class ConsensusRejected(Exception):
@@ -289,6 +312,8 @@ def process_with_consensus(
     if status_callback:
         status_callback(f"Splitting compound image into {layout.count} lens images")
     images, split_info = split_compound_array(read_image(input_path, settings["raw_demosaic"]), **_split_kwargs(settings))
+    exif = read_source_exif(input_path)
+    _export_rig(images, input_path, settings, exif, status_callback)
 
     if status_callback:
         status_callback("Verifying batch lens geometry on this image")
@@ -328,7 +353,7 @@ def process_with_consensus(
         split_info=split_info,
         settings=settings,
         source_path=input_path,
-        exif=read_source_exif(input_path),
+        exif=exif,
     )
     return _finish(input_path, paths, export_result, settings, status_callback)
 
@@ -810,6 +835,9 @@ def run_pipeline(file_paths, emit=None, stop_event=None, settings=None,
         log.info("msalign run: %d image(s), %d worker process(es), settings from %s",
                  total, workers, settings.get("_source", "?"))
         emit(("workers", workers))
+        if settings["metashape_export"] and paths:
+            write_rig_helpers(paths[0].parent / RIG_DIR_NAME, settings,
+                              master_label=nearest_band(settings["output_order"]))
         if use_batch_mode(total, settings):
             emit(("mode", "Batch consensus mode"))
             run.run_batch()

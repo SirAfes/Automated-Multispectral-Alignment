@@ -36,6 +36,7 @@ from .fallback import estimate_xy_plan_b
 from .image_io import find_split_set
 from .layout import LensLayout, layout_from_settings
 from .matching import PreparedImages
+from .exports import write_envi
 from .metadata import build_metadata, tiff_tags, write_sidecar
 from . import parallax
 from .parallax import _crop as parallax_crop
@@ -897,6 +898,7 @@ def export_aligned_tiff(
         )
         output["local_alignment"]["parallax_map"] = parallax_path.name
     metadata_json = write_sidecar(output_tiff, meta) if settings["write_metadata_json"] else None
+    envi_files = write_envi(output_tiff, data, meta) if settings["envi_export"] else None
 
     output.pop("shifts")
     export_result = {
@@ -905,6 +907,7 @@ def export_aligned_tiff(
         "final_size": {"width": win["width"], "height": win["height"]},
         "output_tiff": str(output_tiff),
         "metadata_json": str(metadata_json) if metadata_json else "",
+        "envi": [str(f) for f in envi_files] if envi_files else [],
         "camera": meta["camera"],
         "split_info": split_info,
     }

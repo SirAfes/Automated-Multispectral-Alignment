@@ -189,6 +189,14 @@ Validation on DSC05928 (2350 × 2451 px output, all six lenses): median residual
 
 Related approaches: Tommaselli et al. (ISPRS Archives XLVIII-G-2025) register close-range multi-lens images pixel-wise via a DSM and orthoimages per band, reaching about 1.5 px, but require a rigorous camera calibration. MicaSense's band alignment uses one homography per band and notes it fails when depth parallax is significant.
 
+## Photogrammetry export
+
+The aligned TIFF suits band analysis (indices, classification). For 3D reconstruction it is the wrong input: each band has been shifted — and with `parallax_correction` warped — to match the others, so the stack is no longer a central projection of one camera, and the crop origin can vary per image. Structure-from-motion software needs geometrically untouched images.
+
+`metashape_export` therefore writes, for every capture, each band's *unaligned* lens image (the same centred lens crop for every capture, so each lens keeps a constant principal point) into `metashape/<NN>_<wavelength>/<capture>.tif`. Agisoft's documented multi-camera loading uses exactly this layout: one folder per band, equal file counts, added with Add Folder as a multi-camera system. Each lens band then becomes a sensor of a fixed rig; the bundle adjustment solves the relative lens poses once and models depth parallax through the 3D geometry, which per-image 2D alignment cannot do.
+
+Metadata per file: Make/Model (EXIF of the source), TIFF/EP FocalLength and FocalPlaneX/YResolution (pixel size), and an XMP packet with the `Camera` namespace tags BandName, CentralWavelength, WavelengthFWHM, RigName, RigCameraIndex and a CaptureUUID shared by the bands of one capture (namespace and formats as specified by Pix4D for rig cameras). Whether a given program reads the focal length and pixel size from these tags varies; the folder's README lists the values to enter in Metashape's Camera Calibration if needed, and recommends a bright band (nearest 550 nm) as master.
+
 ## RAW decoding
 
 RAW files are decoded with LibRaw (rawpy) with white balance off, no colour matrix, linear response, no auto-brightening and 16-bit output. Two further choices:
