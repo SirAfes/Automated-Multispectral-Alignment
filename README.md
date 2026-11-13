@@ -63,6 +63,8 @@ Start the `.exe` or `msalign-gui`. Choose **Select images…** or **Select a who
 
 When a folder holds both the RAW and the JPG of a shot, only the RAW is used. Subfolders (for example earlier outputs) are not scanned.
 
+The start window also has check boxes for the optional steps: depth parallax correction, lens images for 3D software (Metashape) and ENVI files. With *Remember these options* they are saved to `pipeline_config.json` next to the program.
+
 ### Command line
 
 ```bash

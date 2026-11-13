@@ -361,6 +361,25 @@ def channel_labels(entry, lens="?") -> tuple[str, str, str]:
     )
 
 
+def save_user_settings(updates: dict, path: Path | None = None) -> Path:
+    """
+    Merge `updates` into pipeline_config.json (next to the program by default),
+    keeping everything else in the file. The result is validated before it is
+    written. Returns the path.
+    """
+    path = path or (_base_dir() / CONFIG_FILENAME)
+    data = {}
+    if path.is_file():
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+    data.update(updates)
+    validate_settings(_merge(DEFAULT_SETTINGS, data))  # unknown or invalid values raise here
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    tmp.replace(path)
+    return path
+
+
 def file_bands_int(settings: dict) -> dict[int, tuple[str, str, str]]:
     """{lens: (R label, G label, B label)}."""
     return {int(k): channel_labels(v, k) for k, v in settings["file_bands"].items()}

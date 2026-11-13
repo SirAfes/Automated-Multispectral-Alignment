@@ -20,7 +20,7 @@ from tkinter import filedialog, messagebox, ttk
 
 from .image_io import file_dialog_types
 from .pipeline import collect_folder_images, run_pipeline, sort_paths, use_batch_mode
-from .settings import load_settings
+from .settings import load_settings, save_user_settings
 
 
 RATE_HISTORY_LENGTH = 72
@@ -572,8 +572,18 @@ class PipelineWindow:
         self.stage_label.configure(text="Stopping after the current image...")
 
 
-def _choose_inputs(root: tk.Tk):
-    """Small launcher: choose individual images or a whole folder."""
+OPTIONS = (
+    ("parallax_correction", "Correct depth parallax",
+     "For close-range scenes with depth. Bands are resampled; kept only if it measurably helps."),
+    ("metashape_export", "Export lens images for 3D software (Metashape)",
+     "Unaligned lens images, one folder per band, for photogrammetry."),
+    ("envi_export", "Also write ENVI files (.img / .hdr)",
+     "For ENVI and hyperspectral software."),
+)
+
+
+def _choose_inputs(root: tk.Tk, settings: dict):
+    """Small launcher: options, then individual images or a whole folder."""
     choice = {"value": None}
 
     dialog = tk.Toplevel(root)
@@ -600,8 +610,19 @@ def _choose_inputs(root: tk.Tk):
         frame,
         text="In a folder with both RAW and JPG of the same shot, only the RAW is used.",
         font=("Segoe UI", 8),
-        wraplength=260,
+        wraplength=300,
     ).pack(anchor="w", pady=(10, 0))
+
+    ttk.Separator(frame).pack(fill="x", pady=(14, 10))
+    ttk.Label(frame, text="Options", font=("Segoe UI", 10)).pack(anchor="w")
+    variables = {}
+    for key, label, hint in OPTIONS:
+        var = tk.BooleanVar(value=bool(settings.get(key)))
+        variables[key] = var
+        ttk.Checkbutton(frame, text=label, variable=var).pack(anchor="w", pady=(6, 0))
+        ttk.Label(frame, text=hint, font=("Segoe UI", 8), wraplength=300).pack(anchor="w", padx=(22, 0))
+    remember = tk.BooleanVar(value=False)
+    ttk.Checkbutton(frame, text="Remember these options", variable=remember).pack(anchor="w", pady=(10, 0))
 
     dialog.protocol("WM_DELETE_WINDOW", lambda: pick(None))
     dialog.update_idletasks()
@@ -610,6 +631,20 @@ def _choose_inputs(root: tk.Tk):
     dialog.geometry(f"+{x}+{y}")
     dialog.grab_set()
     root.wait_window(dialog)
+
+    options = {key: bool(var.get()) for key, var in variables.items()}
+    if choice["value"] and remember.get():
+        try:
+            path = save_user_settings(options)
+        except OSError as exc:
+            messagebox.showwarning(
+                "Options not saved",
+                f"The options apply to this run but could not be saved:\n{exc}",
+                parent=root,
+            )
+        else:
+            settings["_source"] = str(path)
+    settings.update(options)
 
     if choice["value"] == "files":
         return list(filedialog.askopenfilenames(
@@ -648,7 +683,7 @@ def main():
         root.destroy()
         return
 
-    file_paths = _choose_inputs(root)
+    file_paths = _choose_inputs(root, settings)
     if not file_paths:
         root.destroy()
         return

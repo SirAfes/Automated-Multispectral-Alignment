@@ -4,6 +4,8 @@
 
 ### Added
 
+- Desktop app: check boxes for depth parallax correction, the Metashape export and the ENVI export, with an option to remember them in `pipeline_config.json`.
+
 - Photogrammetry export (`metashape_export`): unaligned single-band lens images, one folder per band, in the multi-camera layout Agisoft Metashape loads with Add Folder; focal length, pixel size and XMP Camera band/rig tags in every file; README and a Metashape Pro loading script in the folder.
 - ENVI export (`envi_export`): band-sequential `.img` + `.hdr` with band names, wavelengths and FWHM.
 

@@ -92,3 +92,28 @@ def test_exports_off_by_default(tmp_path):
     result = process_single_file(write_jpg(tmp_path / "N.JPG", make_compound(1)), settings=settings)
     assert not Path(result["tiff"]).with_suffix(".hdr").exists()
     assert not (tmp_path / "metashape").exists()
+
+
+def test_save_user_settings_merges_and_validates(tmp_path):
+    import json
+
+    import pytest
+
+    from msalign.settings import save_user_settings
+
+    cfg = tmp_path / "pipeline_config.json"
+    cfg.write_text(json.dumps({"_comment": "mine", "batch_threshold": 80}))
+    save_user_settings({"parallax_correction": True, "metashape_export": True}, cfg)
+    data = json.loads(cfg.read_text())
+    assert data == {"_comment": "mine", "batch_threshold": 80,
+                    "parallax_correction": True, "metashape_export": True}
+    assert load_settings(cfg)["metashape_export"] is True
+
+    with pytest.raises(ValueError):
+        save_user_settings({"no_such_option": 1}, cfg)
+    assert "no_such_option" not in cfg.read_text()
+
+    new = tmp_path / "fresh" / "pipeline_config.json"
+    new.parent.mkdir()
+    save_user_settings({"envi_export": True}, new)
+    assert json.loads(new.read_text()) == {"envi_export": True}
