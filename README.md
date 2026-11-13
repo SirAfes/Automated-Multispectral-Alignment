@@ -144,6 +144,7 @@ All settings have defaults for the reference camera. To change them, copy [`pipe
 | `output_anchor` | `common_area_center` | Position of the output window (see [Output size](#output-size)) |
 | `tiff_layout` | `multiband` | `multiband`, or `multipage` (one page per band, as before 1.1) |
 | `tiff_compression` | `none` | `none` or `deflate` (lossless, smaller files) |
+| `workers` | `auto` | Images processed at the same time (one per CPU core minus one, limited by free memory); `1` = one after the other |
 | `parallax_correction` | `false` | Depth-dependent correction with a shared disparity map (see [Depth parallax](#depth-parallax)) |
 | `raw_demosaic` | `linear` | `linear` keeps spectral bands separate; `ahd` is LibRaw's default |
 | `parallax_range_px` | [20, 360] | Expected shift between adjacent lenses along their baseline |

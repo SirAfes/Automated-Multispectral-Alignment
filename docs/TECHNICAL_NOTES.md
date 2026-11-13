@@ -207,6 +207,16 @@ Measured on a 9504 × 6336 px synthetic compound image (one CPU core, without RA
 | Primary alignment (5 pairs) | ~59 s | ~2 s |
 | Whole image | ~60 s | ~2.5 s |
 
+### Parallel processing
+
+With `workers` > 1 (default `auto`: CPU cores − 1, at most 8, limited to about 1.5 GB of free memory per RAW image and 0.6 GB per JPG/TIFF), images are processed in separate processes (spawn start method, also used by the Windows executable via `multiprocessing.freeze_support()`). Two 61 MP synthetic images per pair of cores: 3.8 s → 2.2 s per image with two workers on a two-core machine.
+
+- **Same results, independent of timing:** in the first pass, images get no history priors, so the result of an image never depends on which other image happened to finish first. History-guided retries run in the second pass, after the first pass is complete. With `workers: 1` everything runs in order as before, including history priors from the previous images.
+- **Logs:** each worker's log is returned with its result and written to the run log, prefixed with the image name.
+- **Robustness:** if a worker process dies (for example when memory runs out), the images still in progress or waiting are processed one after the other in the main process; the run continues.
+- **Cancel:** no new images are started; images already running finish.
+- The executable's `--self-test` starts a worker process, so a build in which parallel processing cannot start is never published.
+
 The primary method's local search evaluated its NCC with one NumPy call per candidate offset (≈ 230 000 calls per image). It now uses one `cv2.matchTemplate` (`TM_CCOEFF_NORMED`, the same zero-mean NCC) per patch; a test checks that both give identical shifts. Intensity percentiles for normalisation are taken from a regular pixel subsample.
 
 ## Band configuration (reference camera)

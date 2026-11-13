@@ -159,6 +159,12 @@ DEFAULT_SETTINGS = {
     #   "off":      no second copy
     "collection_mode": "hardlink",
 
+    # --- Speed --------------------------------------------------------------
+    # Images processed at the same time in separate processes: "auto" (one
+    # per CPU core minus one, limited by free memory: ~1.5 GB per RAW image)
+    # or a number. 1 = one after the other, as in versions before 1.3.
+    "workers": "auto",
+
     # --- Per-image history (standard mode) ----------------------------------
     "history_length": 5,
 
@@ -277,6 +283,10 @@ def validate_settings(settings: dict) -> dict:
         lens = int(settings["cell_size"] * settings["center_crop_frac"])
         if max(size) > lens:
             raise ValueError(f"output_size_px {list(size)} is larger than a lens image ({lens} px)")
+
+    w = settings["workers"]
+    if not (w == "auto" or (isinstance(w, int) and not isinstance(w, bool) and w >= 1)):
+        raise ValueError("workers must be \"auto\" or a whole number >= 1")
 
     if settings["raw_demosaic"] not in {"linear", "ahd"}:
         raise ValueError("raw_demosaic must be 'linear' or 'ahd'")
