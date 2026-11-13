@@ -150,6 +150,13 @@ DEFAULT_SETTINGS = {
     "tiff_compression": "none",
     # Also write <name>_metadata.json next to the TIFF.
     "write_metadata_json": True,
+    # Also write the aligned stack as ENVI (<name>.img + .hdr, band sequential)
+    # with wavelengths, for ENVI and hyperspectral software.
+    "envi_export": False,
+    # Also write the UNALIGNED lens images, one folder per band, for 3D
+    # reconstruction in Agisoft Metashape and similar software (multi-camera
+    # rig layout, see exports.py). <source folder>/metashape/
+    "metashape_export": False,
 
     # --- Outputs ------------------------------------------------------------
     # Second copy of every final TIFF in <source folder>/tiff.
@@ -158,6 +165,12 @@ DEFAULT_SETTINGS = {
     #   "copy":     independent copy
     #   "off":      no second copy
     "collection_mode": "hardlink",
+
+    # --- Speed --------------------------------------------------------------
+    # Images processed at the same time in separate processes: "auto" (one
+    # per CPU core minus one, limited by free memory: ~1.5 GB per RAW image)
+    # or a number. 1 = one after the other, as in versions before 1.3.
+    "workers": "auto",
 
     # --- Per-image history (standard mode) ----------------------------------
     "history_length": 5,
@@ -278,6 +291,10 @@ def validate_settings(settings: dict) -> dict:
         if max(size) > lens:
             raise ValueError(f"output_size_px {list(size)} is larger than a lens image ({lens} px)")
 
+    w = settings["workers"]
+    if not (w == "auto" or (isinstance(w, int) and not isinstance(w, bool) and w >= 1)):
+        raise ValueError("workers must be \"auto\" or a whole number >= 1")
+
     if settings["raw_demosaic"] not in {"linear", "ahd"}:
         raise ValueError("raw_demosaic must be 'linear' or 'ahd'")
 
@@ -342,6 +359,25 @@ def channel_labels(entry, lens="?") -> tuple[str, str, str]:
     raise ValueError(
         f"file_bands['{lens}'] must be {{\"R\": .., \"G\": .., \"B\": ..}} or a list [R, G, B]"
     )
+
+
+def save_user_settings(updates: dict, path: Path | None = None) -> Path:
+    """
+    Merge `updates` into pipeline_config.json (next to the program by default),
+    keeping everything else in the file. The result is validated before it is
+    written. Returns the path.
+    """
+    path = path or (_base_dir() / CONFIG_FILENAME)
+    data = {}
+    if path.is_file():
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+    data.update(updates)
+    validate_settings(_merge(DEFAULT_SETTINGS, data))  # unknown or invalid values raise here
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    tmp.replace(path)
+    return path
 
 
 def file_bands_int(settings: dict) -> dict[int, tuple[str, str, str]]:

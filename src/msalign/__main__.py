@@ -4,6 +4,9 @@ import sys
 
 
 def main():
+    import multiprocessing
+
+    multiprocessing.freeze_support()
     if len(sys.argv) > 1:
         from .cli import main as cli_main
         sys.exit(cli_main())
