@@ -20,7 +20,10 @@ Compound image (JPG / TIFF / camera RAW)
 Aligned multiband TIFF  +  quality report (TXT / CSV)
 ```
 
-The reference configuration is a 3 × 2 six-lens camera with 14 bands from 405 to 850 nm. Any rectangular lens array (2 × 2, 4 × 4, 1 × 5, …) and any band mapping can be set up in a [settings file](#configuration).
+Two kinds of cameras are supported:
+
+- **Multi-lens cameras with one sensor** that record all lenses in one compound image. The reference configuration is a 3 × 2 six-lens camera (Agrowing Sextuple) with 14 bands from 405 to 850 nm; any rectangular lens array (2 × 2, 4 × 4, 1 × 5, …) and band mapping can be set up in a [settings file](#configuration).
+- **Multi-camera rigs that write one file per band**, such as MicaSense RedEdge / Altum (`IMG_0001_1.tif` … `IMG_0001_5.tif`). Each band is first mapped into one common camera using the lens calibration the camera records per band, then aligned the same way (see [Band-file cameras](#band-file-cameras)).
 
 ## Contents
 
@@ -116,6 +119,8 @@ RAW outputs carry the RAW extension in their name (`DSC06664_ARW`), so the RAW a
 | Standard | `.jpg` `.jpeg` `.png` `.tif` `.tiff` | 8-bit |
 | Camera RAW | `.arw` `.raw` `.dng` `.nef` `.cr2` `.cr3` `.orf` `.rw2` `.raf` `.pef` `.srw` | 16-bit |
 
+| Band files (one per band) | `<capture>_<band>.tif`, single-band TIFF | same as input (16-bit for MicaSense) |
+
 RAW files are decoded with [rawpy](https://github.com/letmaik/rawpy) / LibRaw as close to the sensor data as possible: no white balance, no camera colour matrix, linear response, no automatic brightening. Each sensor channel stays a separate spectral measurement. For quantitative work, prefer RAW: camera JPGs are 8-bit, lossy, and their colour processing mixes the channels.
 
 ### Other formats
@@ -161,6 +166,8 @@ All settings have defaults for the reference camera. To change them, copy [`pipe
 | `workers` | `auto` | Images processed at the same time (one per CPU core minus one, limited by free memory); `1` = one after the other |
 | `envi_export` | `false` | Also write the aligned stack as ENVI `.img` + `.hdr` |
 | `metashape_export` | `false` | Also write the unaligned lens images in a multi-camera layout for 3D software |
+| `input_mode` | `auto` | `compound`, `band_files` (one file per band) or `auto` |
+| `rig_rotation` | `true` | Band files: apply the per-band rig rotations recorded by the camera |
 | `parallax_correction` | `false` | Depth-dependent correction with a shared disparity map (see [Depth parallax](#depth-parallax)) |
 | `raw_demosaic` | `linear` | `linear` keeps spectral bands separate; `ahd` is LibRaw's default |
 | `parallax_range_px` | [20, 360] | Expected shift between adjacent lenses along their baseline |
@@ -210,6 +217,14 @@ The alignment measures only some lens pairs directly; all other relative shifts 
 - **measured pairs** — re-checked with the same metric, so every shift is judged on the same scale.
 
 A pair fails when the best local match is not at the implied shift, or when the implied shift has far weaker support than the other pairs of the same image. With `closure_check: reject` (default) a failed check sends the image to the next stage; with `warn` it is only reported and the quality is set to *low*. The report lists every checked pair with residual and correlation.
+
+### Band-file cameras
+
+Selecting a folder (or the files) of a camera such as MicaSense RedEdge is enough: files named `<capture>_<band>.tif` with at least three single-band TIFFs per capture are recognised automatically (`input_mode`, `band_file_pattern`), and every capture is processed as one image (`IMG_0001/IMG_0001_aligned_multiband.tif`).
+
+Unlike a single-sensor multi-lens camera, every band has its own lens: slightly different focal length, principal point, distortion and orientation. MicaSense records these per band (XMP `PerspectiveFocalLength`, `PrincipalPoint`, `PerspectiveDistortion`, `RigRelatives`); msalign uses them to map every band into the reference band's undistorted camera before the alignment. Band names, wavelengths and band widths are taken from the files. On two MicaSense RedEdge-MX sample captures, the local misalignment (median / worst 90th percentile) went from 1.5 / 3.6 px and 1.5 / 4.9 px as recorded to **0.4 / 0.8 px** after msalign.
+
+The lens positions of such rigs are not recorded, so depth parallax correction is not available for them (the residual check still runs). For 3D reconstruction, load the original files into your photogrammetry software as a multi-camera system.
 
 ### Depth parallax
 

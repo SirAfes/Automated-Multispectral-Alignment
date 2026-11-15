@@ -472,6 +472,8 @@ def write_alignment_quality_report(output_tiff: Path, export_result):
                 f"{a['worst_p90_px']} px, median {b['median_px']} -> {a['median_px']} px"
             )
         else:
+            if local.get("parallax_reason"):
+                lines.append(f"Parallax correction: not applied ({local['parallax_reason']})")
             lines.append(
                 f"Local residual (tile check): median {local['median_px']} px, worst lens p90 "
                 f"{local['worst_p90_px']} px"
@@ -490,11 +492,17 @@ def write_alignment_quality_report(output_tiff: Path, export_result):
 
     split_info = export_result.get("split_info") or {}
     if split_info:
+        expected = (
+            f" (expected {split_info['expected_width']}x{split_info['expected_height']})"
+            if split_info.get("expected_width") else ""
+        )
         lines.append(
-            f"Source size: {split_info.get('source_width')}x{split_info.get('source_height')} "
-            f"(expected {split_info.get('expected_width')}x{split_info.get('expected_height')}), "
+            f"Source size: {split_info.get('source_width')}x{split_info.get('source_height')}{expected}, "
             f"split mode: {split_info.get('split_mode')}"
         )
+        if split_info.get("normalisation"):
+            lines.append(f"Band files: {', '.join(split_info.get('band_files', []))}; "
+                         f"normalisation: {split_info['normalisation']}")
 
     batch = alignment.get("batch_consensus")
     if batch:
@@ -640,6 +648,13 @@ def _local_alignment(images, shifts, band_map, output_order, layout, win, settin
             [parallax.normalise_crop(parallax_crop(pl, x, y, win["width"], win["height"])) for pl in planes],
             axis=0,
         ).astype(np.float32)
+
+    if settings["parallax_correction"] and layout.free:
+        residuals = parallax.check_only(crops, settings)
+        summary = parallax.summarise(residuals)
+        return {"mode": "check", "residuals": _clean_residuals(residuals), **summary,
+                "parallax_applied": False,
+                "parallax_reason": "lens positions unknown for this camera; parallax correction needs a lens grid"}
 
     if not settings["parallax_correction"]:
         residuals = parallax.check_only(crops, settings)

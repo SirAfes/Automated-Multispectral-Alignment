@@ -189,6 +189,26 @@ Validation on DSC05928 (2350 × 2451 px output, all six lenses): median residual
 
 Related approaches: Tommaselli et al. (ISPRS Archives XLVIII-G-2025) register close-range multi-lens images pixel-wise via a DSM and orthoimages per band, reaching about 1.5 px, but require a rigorous camera calibration. MicaSense's band alignment uses one homography per band and notes it fails when depth parallax is significant.
 
+## Band-file cameras (one file per band)
+
+Multi-camera rigs such as MicaSense RedEdge / Altum write one single-band file per band and capture (`IMG_0001_1.tif` … `IMG_0001_5.tif`). `rig_input.py` groups them by `band_file_pattern` (default `^(?P<capture>.+)_(?P<band>\d+)$`); with `input_mode: auto` a file is treated as a band file if its name matches, its capture has at least three such files and it is a single-band TIFF. A run uses the camera of its first capture for all captures.
+
+**Normalisation.** Each band has its own lens and sensor. When every band file carries `PerspectiveFocalLength`, `PrincipalPoint` (both in mm; converted with the EXIF focal-plane resolution) and `PerspectiveDistortion` (MicaSense order k1, k2, k3, p1, p2), every band is resampled into the ideal camera of the reference band — the band the `RigRelatives` refer to (`RigRelativesReferenceRigCameraIndex`) — with `cv2.initUndistortRectifyMap(K_band, distortion, R_band, K_reference)`. `R_band` is built from `RigRelatives` (degrees about x, y, z; `rig_rotation`). What is left is a translation per band (and depth parallax), which the normal alignment handles.
+
+The rotation convention was chosen by measurement, not assumed. Local residual check (median / worst lens 90th percentile, px) on two public MicaSense RedEdge-MX sample captures:
+
+| | IMG_0001 | IMG_0020 |
+|---|---|---|
+| bands as recorded, translation only | 1.50 / 3.61 | 1.46 / 4.85 |
+| undistorted to the reference camera | 0.86 / 2.52 | 0.61 / 1.63 |
+| + rig rotations (sign as recorded) | 1.09 / 1.86 | 0.38 / 1.06 |
+| + rig rotations (opposite sign) | 0.99 / 2.89 | 1.13 / 2.93 |
+| full msalign run (normalisation + alignment) | 0.38 / 0.80 (closure pass) | 0.37 / 0.78 (closure pass) |
+
+The order of the three axis rotations made no measurable difference at these small angles (≤ 0.6°).
+
+**Layout.** The physical lens positions are not recorded, so the lenses form a *free* layout: every lens is aligned directly to the reference, all lens pairs are checked by the closure check, search windows are symmetric, and depth parallax correction is skipped with a note in the report (it needs the baseline directions). Bands of a different resolution (e.g. the thermal band of an Altum) are not supported yet.
+
 ## Photogrammetry export
 
 The aligned TIFF suits band analysis (indices, classification). For 3D reconstruction it is the wrong input: each band has been shifted — and with `parallax_correction` warped — to match the others, so the stack is no longer a central projection of one camera, and the crop origin can vary per image. Structure-from-motion software needs geometrically untouched images.

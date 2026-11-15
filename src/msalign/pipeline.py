@@ -41,6 +41,8 @@ from .matching import PreparedImages
 from .settings import file_bands_int, load_settings
 from .exports import RIG_DIR_NAME, write_rig_helpers, write_rig_images
 from .metadata import read_source_exif
+from .image_io import SPLIT_EXT_RAW
+from .rig_input import capture_name, capture_settings, group_captures, is_band_file, load_capture
 from .split import load_split_info, save_split_cells, split_compound_array
 from .stack import (
     build_band_map,
@@ -72,11 +74,12 @@ def sort_paths(paths) -> list[Path]:
     return sorted((Path(p) for p in paths), key=natural_key)
 
 
-def collect_folder_images(folder, prefer_raw: bool = True) -> list[Path]:
+def collect_folder_images(folder, prefer_raw: bool = True, settings=None) -> list[Path]:
     """
     Supported images directly inside `folder` (not in subfolders, so earlier
     outputs are never picked up). If a shot exists as RAW and JPG, only the RAW
-    file is used when prefer_raw is True.
+    file is used when prefer_raw is True. The band files of a one-file-per-band
+    capture (IMG_0001_1.tif ... IMG_0001_5.tif) are reduced to one entry.
     """
     folder = Path(folder)
     files = [
@@ -91,36 +94,41 @@ def collect_folder_images(folder, prefer_raw: bool = True) -> list[Path]:
             if not (p.suffix.lower() in STANDARD_EXTENSIONS and p.stem.lower() in raw_stems)
         ]
 
-    return sort_paths(files)
+    return sort_paths(group_captures(files, settings or {}))
 
 
-def expand_inputs(paths) -> list[Path]:
+def expand_inputs(paths, settings=None) -> list[Path]:
     """Files are kept, folders are expanded with collect_folder_images; result is sorted."""
     out = []
     for p in map(Path, paths):
         if p.is_dir():
-            out.extend(collect_folder_images(p))
+            out.extend(collect_folder_images(p, settings=settings))
         else:
             out.append(p)
-    return sort_paths(dict.fromkeys(out))
+    return sort_paths(dict.fromkeys(group_captures(out, settings or {})))
 
 
 # ---------------------------------------------------------------------------
 # Single image
 # ---------------------------------------------------------------------------
 
-def output_name(input_path: Path) -> str:
+def output_name(input_path: Path, settings=None) -> str:
     """
     Output base name. RAW files get their extension appended (DSC06664_ARW) so a
     RAW+JPG pair from the same shot never overwrites each other's results.
+    One-file-per-band captures are named after the capture (IMG_0001).
     """
+    input_path = Path(input_path)
+    if settings is not None and is_band_file(input_path, settings):
+        return capture_name(input_path, settings)
     if is_raw_file(input_path):
         return f"{input_path.stem}_{input_path.suffix.lstrip('.').upper()}"
     return input_path.stem
 
 
-def output_paths(input_path: Path):
-    name = output_name(input_path)
+def output_paths(input_path: Path, settings=None):
+    input_path = Path(input_path)
+    name = output_name(input_path, settings)
     base_output_dir = input_path.parent / name
     return {
         "base": base_output_dir,
@@ -227,10 +235,11 @@ def process_single_file(
 ):
     """Full per-image processing: split, search alignment, check, export, report."""
     settings = settings or load_settings()
-    layout = layout_from_settings(settings)
     input_path = Path(input_path)
-    paths = output_paths(input_path)
-    split_ext = split_ext_for_input(input_path)
+    settings = band_settings(input_path, settings)
+    layout = layout_from_settings(settings)
+    paths = output_paths(input_path, settings)
+    split_ext = _split_ext(input_path, settings)
 
     log.info("=== Processing: %s ===", input_path.name)
 
@@ -242,9 +251,7 @@ def process_single_file(
             status_callback("Using existing lens images")
         split_info = load_split_info(paths["split_dir"])
     else:
-        if status_callback:
-            status_callback(f"Splitting compound image into {layout.count} lens images")
-        images, split_info = split_compound_array(read_image(input_path, settings["raw_demosaic"]), **_split_kwargs(settings))
+        images, split_info, settings = read_lens_images(input_path, settings, status_callback)
         save_split_cells(images, paths["split_dir"], split_ext, settings["jpeg_quality"], info=split_info)
         _export_rig(images, input_path, settings, exif, status_callback)
 
@@ -275,7 +282,7 @@ def _export_rig(images, input_path, settings, exif, status_callback=None):
         status_callback("Writing lens images for photogrammetry")
     write_rig_images(
         images, build_band_map(file_bands_int(settings)), settings["output_order"], settings,
-        input_path, output_name(input_path), exif,
+        input_path, output_name(input_path, settings), exif,
     )
 
 
@@ -284,6 +291,46 @@ def nearest_band(output_order, target=550.0):
 
     labelled = [(abs(wavelength_nm(b) - target), b) for b in output_order if wavelength_nm(b) is not None]
     return min(labelled)[1] if labelled else output_order[0]
+
+
+def _split_ext(input_path, settings):
+    return SPLIT_EXT_RAW if is_band_file(input_path, settings) else split_ext_for_input(input_path)
+
+
+def read_lens_images(input_path, settings, status_callback=None):
+    """
+    Lens images of one capture: split from a compound image, or read and
+    normalised from one-file-per-band files. Returns (images, split_info, settings).
+    """
+    if is_band_file(input_path, settings):
+        if status_callback:
+            status_callback("Reading and normalising band files")
+        images, eff, info = load_capture(input_path, settings)
+        h, w = next(iter(images.values())).shape[:2]
+        split_info = {
+            "split_mode": "band_files",
+            "band_files": [f.name for f in info["files"].values()],
+            "normalisation": info["normalisation"],
+            "source_width": int(w), "source_height": int(h),
+            "lens_size": int(min(h, w)),
+            "lens_scale": 1.0,
+            "lens_origins": {str(k): [0, 0] for k in images},
+        }
+        return images, split_info, eff
+    layout = layout_from_settings(settings)
+    if status_callback:
+        status_callback(f"Splitting compound image into {layout.count} lens images")
+    images, split_info = split_compound_array(
+        read_image(input_path, settings["raw_demosaic"]), **_split_kwargs(settings)
+    )
+    return images, split_info, settings
+
+
+def band_settings(input_path, settings):
+    """Settings for this input (unchanged for compound images)."""
+    if is_band_file(input_path, settings) and not settings.get("_band_capture"):
+        return capture_settings(input_path, settings)[0]
+    return settings
 
 
 class ConsensusRejected(Exception):
@@ -303,15 +350,14 @@ def process_with_consensus(
     Raises ConsensusRejected if not confirmed.
     """
     settings = settings or load_settings()
-    layout = layout_from_settings(settings)
     input_path = Path(input_path)
-    paths = output_paths(input_path)
+    settings = band_settings(input_path, settings)
+    layout = layout_from_settings(settings)
+    paths = output_paths(input_path, settings)
 
     log.info("=== Processing (batch consensus): %s ===", input_path.name)
 
-    if status_callback:
-        status_callback(f"Splitting compound image into {layout.count} lens images")
-    images, split_info = split_compound_array(read_image(input_path, settings["raw_demosaic"]), **_split_kwargs(settings))
+    images, split_info, settings = read_lens_images(input_path, settings, status_callback)
     exif = read_source_exif(input_path)
     _export_rig(images, input_path, settings, exif, status_callback)
 
@@ -339,7 +385,7 @@ def process_with_consensus(
 
     if settings["batch_keep_split_images"]:
         save_split_cells(
-            images, paths["split_dir"], split_ext_for_input(input_path), settings["jpeg_quality"],
+            images, paths["split_dir"], _split_ext(input_path, settings), settings["jpeg_quality"],
             info=split_info,
         )
 
@@ -631,7 +677,7 @@ class _Run:
             src = self.paths[i]
             try:
                 images = load_split_images(
-                    output_paths(src)["split_dir"], split_ext_for_input(src), self.layout.count
+                    output_paths(src, s)["split_dir"], _split_ext(src, s), self.layout.count
                 )
                 own = self.success[i]["alignment"]["apply_shifts"]
                 verifications.append(
@@ -823,6 +869,9 @@ def run_pipeline(file_paths, emit=None, stop_event=None, settings=None,
     settings = settings or load_settings()
     emit = emit or (lambda event: None)
     paths = [Path(p) for p in file_paths]
+    if paths:
+        # one camera per run: band-file captures share the settings of the first
+        settings = band_settings(paths[0], settings)
 
     files = RunFiles(paths[0].parent, verbose) if (run_files and paths) else None
     workers = resolve_workers(settings["workers"], len(paths), any(is_raw_file(p) for p in paths))

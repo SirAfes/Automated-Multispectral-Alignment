@@ -4,6 +4,8 @@
 
 ### Added
 
+- One-file-per-band cameras (MicaSense RedEdge / Altum and similar): band files are grouped into captures, mapped into the reference band's undistorted camera with the per-band lens calibration and rig rotations from XMP, then aligned, checked and exported like compound images. Band names, wavelengths and FWHM come from the files. On MicaSense RedEdge-MX samples: local misalignment 1.5 / 3.6-4.9 px -> 0.4 / 0.8 px (median / worst 90th percentile).
+
 - Desktop app: check boxes for depth parallax correction, the Metashape export and the ENVI export, with an option to remember them in `pipeline_config.json`.
 
 - Photogrammetry export (`metashape_export`): unaligned single-band lens images, one folder per band, in the multi-camera layout Agisoft Metashape loads with Add Folder; focal length, pixel size and XMP Camera band/rig tags in every file; README and a Metashape Pro loading script in the folder.

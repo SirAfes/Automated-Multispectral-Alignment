@@ -20,6 +20,7 @@ from tkinter import filedialog, messagebox, ttk
 
 from .image_io import file_dialog_types
 from .pipeline import collect_folder_images, run_pipeline, sort_paths, use_batch_mode
+from .rig_input import group_captures
 from .settings import load_settings, save_user_settings
 
 
@@ -647,17 +648,17 @@ def _choose_inputs(root: tk.Tk, settings: dict):
     settings.update(options)
 
     if choice["value"] == "files":
-        return list(filedialog.askopenfilenames(
+        return group_captures(filedialog.askopenfilenames(
             parent=root,
             title="Select one or more compound multispectral images",
             filetypes=file_dialog_types(),
-        ))
+        ), settings)
 
     if choice["value"] == "folder":
         folder = filedialog.askdirectory(parent=root, title="Select a folder of compound images")
         if not folder:
             return []
-        files = collect_folder_images(folder)
+        files = collect_folder_images(folder, settings=settings)
         if not files:
             messagebox.showinfo(
                 "No images found",

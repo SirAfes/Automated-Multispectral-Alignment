@@ -25,6 +25,11 @@ class LensLayout:
     cols: int
     primary_reference: int = 1
     fallback_reference: int | None = None
+    # "free": lens positions are not on a known grid (e.g. one file per band
+    # from a multi-camera rig). All pairs are neighbours, the fallback is a
+    # star around the reference, search windows are symmetric, and no
+    # baseline direction is known for parallax correction.
+    free: bool = False
     fallback_tree: tuple[Edge, ...] = field(init=False)
 
     def __post_init__(self):
@@ -34,6 +39,8 @@ class LensLayout:
             value = getattr(self, name)
             if value is not None and not 1 <= value <= self.count:
                 raise ValueError(f"{name} must be between 1 and {self.count}")
+        if self.fallback_reference is None and self.free:
+            object.__setattr__(self, "fallback_reference", self.primary_reference)
         if self.fallback_reference is None:
             center = ((self.rows - 1) // 2) * self.cols + (self.cols - 1) // 2 + 1
             object.__setattr__(self, "fallback_reference", center)
@@ -57,7 +64,9 @@ class LensLayout:
 
     @property
     def grid_edges(self) -> list[Edge]:
-        """All horizontally or vertically adjacent lens pairs (a < b)."""
+        """All horizontally or vertically adjacent lens pairs (a < b); all pairs for a free layout."""
+        if self.free:
+            return [(a, b) for a in self.lenses for b in self.lenses if a < b]
         edges = []
         for lens in self.lenses:
             row, col = self.position(lens)
@@ -78,6 +87,9 @@ class LensLayout:
 
         Default 3 x 2 camera (reference 2): 2->5, 2->1, 2->3, 5->4, 5->6.
         """
+        if self.free:
+            ref = self.fallback_reference
+            return tuple((ref, k) for k in self.lenses if k != ref)
         r0, c0 = self.position(self.fallback_reference)
         edges = []
 
@@ -115,6 +127,8 @@ class LensLayout:
         """
         (r1, c1), (r2, c2) = self.position(ref), self.position(mov)
         lo, hi = float(parallax_range[0]), float(parallax_range[1])
+        if self.free:
+            return {"dx_min": int(-hi), "dx_max": int(hi), "dy_min": int(-hi), "dy_max": int(hi)}
 
         def axis(steps):
             if steps == 0:
@@ -136,4 +150,5 @@ def layout_from_settings(settings: dict) -> LensLayout:
         cols=int(settings["grid_cols"]),
         primary_reference=int(settings["primary_reference_lens"]),
         fallback_reference=settings.get("fallback_reference_lens"),
+        free=settings.get("rig_layout") == "free",
     )

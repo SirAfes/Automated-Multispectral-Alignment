@@ -34,6 +34,18 @@ DEFAULT_SETTINGS = {
     "center_crop_frac": 0.80,
     "jpeg_quality": 100,
 
+    # --- Input type -----------------------------------------------------------
+    # "compound": one image holds all lenses (Agrowing and similar);
+    # "band_files": one file per band per capture (MicaSense RedEdge / Altum:
+    #     IMG_0001_1.tif ... IMG_0001_5.tif), see rig_input.py;
+    # "auto": band files are recognised by name (band_file_pattern), at least
+    #     three bands per capture and single-band TIFFs.
+    "input_mode": "auto",
+    "band_file_pattern": r"^(?P<capture>.+)_(?P<band>\d+)$",
+    # Apply the per-band rig rotations recorded by the camera (RigRelatives)
+    # when mapping band files into the reference camera.
+    "rig_rotation": True,
+
     # --- Camera RAW decoding ----------------------------------------------
     # "linear": bilinear demosaicing from same-colour neighbours only (keeps
     # spectral bands separate); "ahd": LibRaw's default, correlation-based
@@ -294,6 +306,17 @@ def validate_settings(settings: dict) -> dict:
     w = settings["workers"]
     if not (w == "auto" or (isinstance(w, int) and not isinstance(w, bool) and w >= 1)):
         raise ValueError("workers must be \"auto\" or a whole number >= 1")
+
+    if settings["input_mode"] not in {"auto", "compound", "band_files"}:
+        raise ValueError("input_mode must be 'auto', 'compound' or 'band_files'")
+    try:
+        import re as _re
+
+        pattern = _re.compile(settings["band_file_pattern"])
+    except Exception as exc:
+        raise ValueError(f"band_file_pattern is not a valid regular expression: {exc}") from exc
+    if not {"capture", "band"} <= set(pattern.groupindex):
+        raise ValueError("band_file_pattern needs the groups (?P<capture>...) and (?P<band>...)")
 
     if settings["raw_demosaic"] not in {"linear", "ahd"}:
         raise ValueError("raw_demosaic must be 'linear' or 'ahd'")
