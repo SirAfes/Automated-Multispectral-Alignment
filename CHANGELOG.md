@@ -15,6 +15,8 @@
 
 ### Fixed
 
+- Agisoft Metashape no longer offered the multispectral / multi-camera layout for the aligned TIFF (since 1.1). The default TIFF is again one page per band (`tiff_layout: multipage`), like Agrowing's own multispectral TIFFs; `multiband` remains available for GDAL / QGIS.
+- Focal length, pixel size and exposure are also written as a standard EXIF block, where Metashape and other photogrammetry software read them; previously they were only in the main TIFF directory. Applies to the Metashape export too.
 - Windows executable failed at start with "No module named 'msalign'" (since 1.0); the build now runs the executable's self-test.
 
 ## 1.2.0

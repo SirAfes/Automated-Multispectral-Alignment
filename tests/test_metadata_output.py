@@ -50,7 +50,11 @@ def add_exif(path: Path, make="SONY", model="ILCE-7RM4", focal=None):
 def tags_of(path):
     with tifffile.TiffFile(path) as tif:
         page = tif.pages[0]
-        return {t.code: t.value for t in page.tags.values()}, len(tif.pages), page.asarray()
+        if len(tif.pages) > 1:
+            data = np.stack([p.asarray() for p in tif.pages])
+        else:
+            data = page.asarray()
+        return {t.code: t.value for t in page.tags.values()}, len(tif.pages), data
 
 
 def gdal_items(xml):
@@ -81,8 +85,21 @@ def test_tiff_has_camera_band_and_processing_metadata(tmp_path):
     result = process_single_file(src, settings=settings)
 
     tags, pages, data = tags_of(result["tiff"])
-    # one image with all bands, not one page per band
-    assert pages == 1 and data.shape == (14, *SIZE[::-1])
+    # one single-band page per band, like Agrowing's own multispectral TIFFs
+    # (the layout Metashape offers as a multispectral image)
+    assert pages == 14 and data.shape == (14, *SIZE[::-1])
+    with tifffile.TiffFile(result["tiff"]) as tif:
+        assert all(p.samplesperpixel == 1 for p in tif.pages)
+        assert [p.tags[285].value for p in tif.pages][:2] == ["405 nm", "430 nm"]
+        # a real EXIF block (sub-IFD 34665), where photogrammetry software reads it
+        exif = tif.pages[0].tags[34665].value
+        assert exif["FocalLength"] == (109, 5)
+        assert exif["ExifVersion"] in ("0232", b"0232")
+        assert exif["DateTimeOriginal"] == "2026:11:01 10:30:00"
+        assert exif["FocalPlaneResolutionUnit"] == 3
+    roundtrip = read_source_exif(Path(result["tiff"]))
+    assert roundtrip["focal_length_mm"] == pytest.approx(21.8)
+    assert roundtrip["datetime_original"] == "2026:11:01 10:30:00"
 
     assert tags[271] == "SONY" and tags[272] == "ILCE-7RM4"           # from EXIF
     assert tags[37386] == (109, 5)                                     # 21.8 mm from settings
@@ -134,11 +151,14 @@ def test_raw_output_is_16bit_with_metadata(tmp_path, fake_rawpy):
     assert fake_rawpy.calls[-1]["demosaic_algorithm"] == "AHD"
 
 
-def test_legacy_multipage_layout(tmp_path):
-    settings = make_settings(tmp_path, tiff_layout="multipage")
+def test_multiband_layout(tmp_path):
+    settings = make_settings(tmp_path, tiff_layout="multiband")
     src = add_exif(write_jpg(tmp_path / "L.JPG", make_compound(1)))
-    tags, pages, _ = tags_of(process_single_file(src, settings=settings)["tiff"])
-    assert pages == 14 and tags[272] == "ILCE-7RM4" and 42112 in tags
+    result = process_single_file(src, settings=settings)
+    tags, pages, data = tags_of(result["tiff"])
+    assert pages == 1 and data.shape == (14, *SIZE[::-1])
+    assert tags[272] == "ILCE-7RM4" and 42112 in tags
+    assert tags[34665]["FocalLength"] == (109, 5)
 
 
 def test_deflate_compression_roundtrip(tmp_path):

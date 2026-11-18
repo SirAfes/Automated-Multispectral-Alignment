@@ -104,7 +104,7 @@ D:/survey/
     └── 20261105_141502_summary.csv                           ← one row per image
 ```
 
-- **Multiband TIFF:** one image with all bands in the configured wavelength order, the same size for every image (2048 × 2048 px for the reference camera). 8-bit for JPG input, 16-bit for RAW input. GDAL, QGIS, rasterio and ENVI read it as one multiband raster.
+- **Multispectral TIFF:** one single-band page per band in the configured wavelength order, like the camera makers' own multispectral TIFFs, the same size for every image (2048 × 2048 px for the reference camera). 8-bit for JPG input, 16-bit for RAW input. Agisoft Metashape loads it as a multispectral image (Add Photos > *Multi-camera system*); camera, focal length, pixel size and exposure are in a standard EXIF block. For GDAL / QGIS / rasterio, set `tiff_layout: multiband` (one image with all bands) or use the ENVI export.
 - **Metadata in the TIFF:** camera make and model, lens, focal length and pixel size; for every band its name (`405 nm`), centre wavelength, band width, lens and sensor channel; and the processing record (msalign version, alignment mode, lens shifts, crop position). See [Metadata](#metadata).
 - **`tiff/` folder:** a hard link by default — the same file under a second name, using no extra disk space. Can be switched to a real copy or off.
 - **Quality report:** for every lens pair the method, shift, support and confidence, plus the [closure check](#closure-check).
@@ -161,7 +161,7 @@ All settings have defaults for the reference camera. To change them, copy [`pipe
 | `camera` | Agrowing Sextuple | Lens, focal length, pixel size and band width written into the TIFF |
 | `output_size_px` | [2048, 2048] | Fixed output size; `null` = largest area all lenses share |
 | `output_anchor` | `common_area_center` | Position of the output window (see [Output size](#output-size)) |
-| `tiff_layout` | `multiband` | `multiband`, or `multipage` (one page per band, as before 1.1) |
+| `tiff_layout` | `multipage` | `multipage` (one page per band; Metashape multispectral), or `multiband` (one image with all bands; GDAL / QGIS) |
 | `tiff_compression` | `none` | `none` or `deflate` (lossless, smaller files) |
 | `workers` | `auto` | Images processed at the same time (one per CPU core minus one, limited by free memory); `1` = one after the other |
 | `envi_export` | `false` | Also write the aligned stack as ENVI `.img` + `.hdr` |
