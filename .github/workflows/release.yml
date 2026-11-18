@@ -57,7 +57,7 @@ jobs:
       - run: python -m pytest -q tests
 
   python-package:
-    needs: test
+    needs: [check, test]  # check: tag and version outputs
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -80,7 +80,7 @@ jobs:
           path: dist/*
 
   windows-exe:
-    needs: test
+    needs: [check, test]  # check: tag and version outputs
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v5
@@ -152,9 +152,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           TAG="${{ needs.check.outputs.tag }}"
+          TITLE="msalign ${{ needs.check.outputs.version }}"
           if gh release view "$TAG" >/dev/null 2>&1; then
+            # remove assets of an earlier build that this build does not replace
+            for old in $(gh release view "$TAG" --json assets --jq '.assets[].name'); do
+              [ -e "assets/$old" ] || gh release delete-asset "$TAG" "$old" --yes
+            done
             gh release upload "$TAG" assets/* --clobber
-            gh release edit "$TAG" --notes-file notes.md
+            gh release edit "$TAG" --title "$TITLE" --notes-file notes.md
           else
-            gh release create "$TAG" assets/* --title "msalign ${{ needs.check.outputs.version }}" --notes-file notes.md
+            gh release create "$TAG" assets/* --title "$TITLE" --notes-file notes.md
           fi
