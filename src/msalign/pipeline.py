@@ -39,9 +39,13 @@ from .image_io import (
 from .layout import layout_from_settings
 from .matching import PreparedImages
 from .settings import file_bands_int, load_settings
+from .exports import RIG_DIR_NAME, write_rig_helpers, write_rig_images
 from .metadata import read_source_exif
+from .image_io import SPLIT_EXT_RAW
+from .rig_input import capture_name, capture_settings, group_captures, is_band_file, load_capture
 from .split import load_split_info, save_split_cells, split_compound_array
 from .stack import (
+    build_band_map,
     build_alignment_priors,
     export_aligned_tiff,
     export_multipage_tiff_from_split,
@@ -70,11 +74,12 @@ def sort_paths(paths) -> list[Path]:
     return sorted((Path(p) for p in paths), key=natural_key)
 
 
-def collect_folder_images(folder, prefer_raw: bool = True) -> list[Path]:
+def collect_folder_images(folder, prefer_raw: bool = True, settings=None) -> list[Path]:
     """
     Supported images directly inside `folder` (not in subfolders, so earlier
     outputs are never picked up). If a shot exists as RAW and JPG, only the RAW
-    file is used when prefer_raw is True.
+    file is used when prefer_raw is True. The band files of a one-file-per-band
+    capture (IMG_0001_1.tif ... IMG_0001_5.tif) are reduced to one entry.
     """
     folder = Path(folder)
     files = [
@@ -89,36 +94,41 @@ def collect_folder_images(folder, prefer_raw: bool = True) -> list[Path]:
             if not (p.suffix.lower() in STANDARD_EXTENSIONS and p.stem.lower() in raw_stems)
         ]
 
-    return sort_paths(files)
+    return sort_paths(group_captures(files, settings or {}))
 
 
-def expand_inputs(paths) -> list[Path]:
+def expand_inputs(paths, settings=None) -> list[Path]:
     """Files are kept, folders are expanded with collect_folder_images; result is sorted."""
     out = []
     for p in map(Path, paths):
         if p.is_dir():
-            out.extend(collect_folder_images(p))
+            out.extend(collect_folder_images(p, settings=settings))
         else:
             out.append(p)
-    return sort_paths(dict.fromkeys(out))
+    return sort_paths(dict.fromkeys(group_captures(out, settings or {})))
 
 
 # ---------------------------------------------------------------------------
 # Single image
 # ---------------------------------------------------------------------------
 
-def output_name(input_path: Path) -> str:
+def output_name(input_path: Path, settings=None) -> str:
     """
     Output base name. RAW files get their extension appended (DSC06664_ARW) so a
     RAW+JPG pair from the same shot never overwrites each other's results.
+    One-file-per-band captures are named after the capture (IMG_0001).
     """
+    input_path = Path(input_path)
+    if settings is not None and is_band_file(input_path, settings):
+        return capture_name(input_path, settings)
     if is_raw_file(input_path):
         return f"{input_path.stem}_{input_path.suffix.lstrip('.').upper()}"
     return input_path.stem
 
 
-def output_paths(input_path: Path):
-    name = output_name(input_path)
+def output_paths(input_path: Path, settings=None):
+    input_path = Path(input_path)
+    name = output_name(input_path, settings)
     base_output_dir = input_path.parent / name
     return {
         "base": base_output_dir,
@@ -225,13 +235,15 @@ def process_single_file(
 ):
     """Full per-image processing: split, search alignment, check, export, report."""
     settings = settings or load_settings()
-    layout = layout_from_settings(settings)
     input_path = Path(input_path)
-    paths = output_paths(input_path)
-    split_ext = split_ext_for_input(input_path)
+    settings = band_settings(input_path, settings)
+    layout = layout_from_settings(settings)
+    paths = output_paths(input_path, settings)
+    split_ext = _split_ext(input_path, settings)
 
     log.info("=== Processing: %s ===", input_path.name)
 
+    exif = read_source_exif(input_path)
     images = None
     split_info = {}
     if reuse_split and find_split_set(paths["split_dir"], split_ext, layout.count):
@@ -239,10 +251,9 @@ def process_single_file(
             status_callback("Using existing lens images")
         split_info = load_split_info(paths["split_dir"])
     else:
-        if status_callback:
-            status_callback(f"Splitting compound image into {layout.count} lens images")
-        images, split_info = split_compound_array(read_image(input_path, settings["raw_demosaic"]), **_split_kwargs(settings))
+        images, split_info, settings = read_lens_images(input_path, settings, status_callback)
         save_split_cells(images, paths["split_dir"], split_ext, settings["jpeg_quality"], info=split_info)
+        _export_rig(images, input_path, settings, exif, status_callback)
 
     if images is None:
         images = load_split_images(paths["split_dir"], split_ext, layout.count)
@@ -258,9 +269,68 @@ def process_single_file(
         split_info=split_info,
         settings=settings,
         source_path=input_path,
-        exif=read_source_exif(input_path),
+        exif=exif,
     )
     return _finish(input_path, paths, export_result, settings, status_callback)
+
+
+def _export_rig(images, input_path, settings, exif, status_callback=None):
+    """Unaligned single-band lens images for photogrammetry (metashape_export)."""
+    if not settings["metashape_export"]:
+        return
+    if status_callback:
+        status_callback("Writing lens images for photogrammetry")
+    write_rig_images(
+        images, build_band_map(file_bands_int(settings)), settings["output_order"], settings,
+        input_path, output_name(input_path, settings), exif,
+    )
+
+
+def nearest_band(output_order, target=550.0):
+    from .metadata import wavelength_nm
+
+    labelled = [(abs(wavelength_nm(b) - target), b) for b in output_order if wavelength_nm(b) is not None]
+    return min(labelled)[1] if labelled else output_order[0]
+
+
+def _split_ext(input_path, settings):
+    return SPLIT_EXT_RAW if is_band_file(input_path, settings) else split_ext_for_input(input_path)
+
+
+def read_lens_images(input_path, settings, status_callback=None):
+    """
+    Lens images of one capture: split from a compound image, or read and
+    normalised from one-file-per-band files. Returns (images, split_info, settings).
+    """
+    if is_band_file(input_path, settings):
+        if status_callback:
+            status_callback("Reading and normalising band files")
+        images, eff, info = load_capture(input_path, settings)
+        h, w = next(iter(images.values())).shape[:2]
+        split_info = {
+            "split_mode": "band_files",
+            "band_files": [f.name for f in info["files"].values()],
+            "normalisation": info["normalisation"],
+            "source_width": int(w), "source_height": int(h),
+            "lens_size": int(min(h, w)),
+            "lens_scale": 1.0,
+            "lens_origins": {str(k): [0, 0] for k in images},
+        }
+        return images, split_info, eff
+    layout = layout_from_settings(settings)
+    if status_callback:
+        status_callback(f"Splitting compound image into {layout.count} lens images")
+    images, split_info = split_compound_array(
+        read_image(input_path, settings["raw_demosaic"]), **_split_kwargs(settings)
+    )
+    return images, split_info, settings
+
+
+def band_settings(input_path, settings):
+    """Settings for this input (unchanged for compound images)."""
+    if is_band_file(input_path, settings) and not settings.get("_band_capture"):
+        return capture_settings(input_path, settings)[0]
+    return settings
 
 
 class ConsensusRejected(Exception):
@@ -280,15 +350,16 @@ def process_with_consensus(
     Raises ConsensusRejected if not confirmed.
     """
     settings = settings or load_settings()
-    layout = layout_from_settings(settings)
     input_path = Path(input_path)
-    paths = output_paths(input_path)
+    settings = band_settings(input_path, settings)
+    layout = layout_from_settings(settings)
+    paths = output_paths(input_path, settings)
 
     log.info("=== Processing (batch consensus): %s ===", input_path.name)
 
-    if status_callback:
-        status_callback(f"Splitting compound image into {layout.count} lens images")
-    images, split_info = split_compound_array(read_image(input_path, settings["raw_demosaic"]), **_split_kwargs(settings))
+    images, split_info, settings = read_lens_images(input_path, settings, status_callback)
+    exif = read_source_exif(input_path)
+    _export_rig(images, input_path, settings, exif, status_callback)
 
     if status_callback:
         status_callback("Verifying batch lens geometry on this image")
@@ -314,7 +385,7 @@ def process_with_consensus(
 
     if settings["batch_keep_split_images"]:
         save_split_cells(
-            images, paths["split_dir"], split_ext_for_input(input_path), settings["jpeg_quality"],
+            images, paths["split_dir"], _split_ext(input_path, settings), settings["jpeg_quality"],
             info=split_info,
         )
 
@@ -328,7 +399,7 @@ def process_with_consensus(
         split_info=split_info,
         settings=settings,
         source_path=input_path,
-        exif=read_source_exif(input_path),
+        exif=exif,
     )
     return _finish(input_path, paths, export_result, settings, status_callback)
 
@@ -408,8 +479,10 @@ class _Run:
         ("run_files", log_path, summary_path)   emitted by run_pipeline
     """
 
-    def __init__(self, file_paths, emit, stop_event, settings, run_files=None):
+    def __init__(self, file_paths, emit, stop_event, settings, run_files=None, workers=1, verbose=False):
         self.paths = [Path(p) for p in file_paths]
+        self.workers = workers
+        self.verbose = verbose
         self._emit = emit
         self.stop_event = stop_event
         self.settings = settings
@@ -461,44 +534,139 @@ class _Run:
             alignments, max_samples=max_samples or self.history, layout=self.layout
         )
 
-    # --- steps --------------------------------------------------------------
+    # --- task execution -----------------------------------------------------
+    #
+    # Every image of a phase is a task. With one worker, tasks run here in
+    # order, exactly as before (history priors from the previous images).
+    # With several workers, tasks run in separate processes; the first pass
+    # then uses no history priors, so results do not depend on which image
+    # happens to finish first. History is used in the second pass, which
+    # starts only after the first pass is complete.
 
-    def standard(self, index, priors, phase="initial"):
-        """Full alignment for one image; failures go to the retry queue."""
-        path = self.paths[index]
-        self.emit(("file_start", index, path.name, phase))
-        started = time.perf_counter()
+    def parallel(self):
+        return self.workers > 1
+
+    def _run_tasks(self, tasks):
+        """
+        tasks: list of dicts with index, phase, kind ("standard" | "consensus" |
+        "retry"), and the arguments of _worker. "priors" may be a callable
+        (evaluated just before the task runs, sequential mode only).
+        """
+        if not tasks:
+            return
+        if not self.parallel():
+            for task in tasks:
+                if self.stopped():
+                    return
+                if callable(task.get("priors")):
+                    task["priors"] = task["priors"]()
+                self.emit(("file_start", task["index"], self.paths[task["index"]].name, task["phase"]))
+                outcome = _worker(task, status_callback=self._status(task["index"], task["phase"]))
+                self._handle(task, outcome)
+            return
+
+        import concurrent.futures as cf
+        import multiprocessing
+        from concurrent.futures.process import BrokenProcessPool
+
+        context = multiprocessing.get_context("spawn")
+        queue = list(tasks)
+        running = {}
+        broken = False
+        pool = cf.ProcessPoolExecutor(max_workers=self.workers, mp_context=context)
         try:
-            result = process_single_file(
-                path,
-                alignment_priors=priors,
-                status_callback=self._status(index, phase),
-                settings=self.settings,
+            def submit():
+                while queue and len(running) < self.workers and not self.stopped():
+                    task = queue[0]
+                    if callable(task.get("priors")):
+                        task["priors"] = None
+                    task["capture_log"] = True
+                    task["verbose"] = self.verbose
+                    future = pool.submit(_worker, task)  # may raise BrokenProcessPool
+                    queue.pop(0)
+                    self.emit(("file_start", task["index"], self.paths[task["index"]].name, task["phase"]))
+                    running[future] = task
+
+            submit()
+            while running:
+                done, _ = cf.wait(running, return_when=cf.FIRST_COMPLETED)
+                for future in done:
+                    try:
+                        outcome = future.result()
+                    except BrokenProcessPool:
+                        raise  # the task stays in `running` and is redone below
+                    except Exception as exc:
+                        outcome = {"ok": False, "error": f"worker failed: {short_error(exc)}",
+                                   "elapsed": 0.0, "log": ""}
+                    task = running.pop(future)
+                    self._handle(task, outcome)
+                if self.stopped():
+                    queue.clear()
+                submit()
+        except BrokenProcessPool:
+            # A worker process died (for example out of memory). Finish the
+            # remaining images one after the other in this process.
+            broken = True
+            unfinished = sorted(running.values(), key=lambda t: t["index"]) + queue
+            log.warning(
+                "A worker process stopped unexpectedly; processing the remaining %d image(s) "
+                "one at a time.", len(unfinished),
             )
-            elapsed = time.perf_counter() - started
-            self.success[index] = result
-            self.emit(("success", index, result, elapsed, False))
-        except Exception as exc:
-            elapsed = time.perf_counter() - started
-            log.info("%s: first pass failed: %s", path.name, exc)
-            log.debug(traceback.format_exc())
-            self.pending_retry.append({
-                "index": index,
-                "path": path,
-                "first_error": short_error(exc),
-            })
-            self.emit(("retry_queued", index, short_error(exc), elapsed))
+            self.emit(("phase", "A worker process stopped; continuing one image at a time"))
+        finally:
+            pool.shutdown(wait=not broken, cancel_futures=True)
+
+        if broken:
+            for task in unfinished:
+                task.pop("capture_log", None)
+            workers, self.workers = self.workers, 1
+            try:
+                self._run_tasks(unfinished)
+            finally:
+                self.workers = workers
+
+    def _handle(self, task, outcome):
+        index, phase = task["index"], task["phase"]
+        path = self.paths[index]
+        if outcome.get("log"):
+            for line in outcome["log"].rstrip().splitlines():
+                log.info("[%s] %s", path.name, line)
+        if outcome.get("consensus_rejected"):
+            log.info("%s: %s -> full alignment", path.name, outcome["consensus_rejected"])
+            self.emit(("stage", index, "Geometry differs - ran full alignment", phase))
+        elapsed = outcome["elapsed"]
+
+        if outcome["ok"]:
+            self.success[index] = outcome["result"]
+            self.emit(("success", index, outcome["result"], elapsed, phase == "retry"))
+        elif phase == "retry":
+            self.emit((
+                "final_error", index,
+                f"First pass: {task['first_error']} | History-guided retry: {outcome['error']}",
+                elapsed,
+            ))
+        else:
+            log.info("%s: first pass failed: %s", path.name, outcome["error"])
+            self.pending_retry.append({"index": index, "path": path, "first_error": outcome["error"]})
+            self.emit(("retry_queued", index, outcome["error"], elapsed))
         self.emit(("attempt_complete", elapsed))
+
+    def _standard_task(self, index, phase, priors):
+        return {
+            "index": index, "phase": phase, "kind": "standard",
+            "path": str(self.paths[index]), "priors": priors, "settings": self.settings,
+        }
+
+    # --- phases -------------------------------------------------------------
 
     def previous_priors(self, index):
         previous = sorted(i for i in self.success if i < index)[-self.history:]
         return self.priors([self.success[i]["alignment"] for i in previous])
 
-    def run_standard(self, indices):
-        for index in indices:
-            if self.stopped():
-                return
-            self.standard(index, self.previous_priors(index))
+    def run_standard(self, indices, phase="initial"):
+        self._run_tasks([
+            self._standard_task(i, phase, lambda i=i: self.previous_priors(i)) for i in indices
+        ])
 
     def _calibration_thresholds(self, agreeing, consensus):
         """Verification correlation on calibration images at their own known-good shifts."""
@@ -509,7 +677,7 @@ class _Run:
             src = self.paths[i]
             try:
                 images = load_split_images(
-                    output_paths(src)["split_dir"], split_ext_for_input(src), self.layout.count
+                    output_paths(src, s)["split_dir"], _split_ext(src, s), self.layout.count
                 )
                 own = self.success[i]["alignment"]["apply_shifts"]
                 verifications.append(
@@ -525,10 +693,9 @@ class _Run:
         calib = calibration_indices(total, int(s["batch_calibration_samples"]))
 
         self.emit(("phase", f"Calibration: fully aligning {len(calib)} sample images"))
-        for index in calib:
-            if self.stopped():
-                return
-            self.standard(index, self.previous_priors(index), phase="calibration")
+        self.run_standard(calib, phase="calibration")
+        if self.stopped():
+            return
 
         calib_ok = [i for i in calib if i in self.success]
         consensus = compute_consensus(
@@ -552,46 +719,22 @@ class _Run:
         log.info("Verification correlation thresholds: %s", thresholds)
         self.emit(("phase", f"Applying batch geometry ({consensus['reason']})"))
 
-        for index in rest:
-            if self.stopped():
-                return
-            path = self.paths[index]
-            self.emit(("file_start", index, path.name, "consensus"))
-            started = time.perf_counter()
-            try:
-                result = process_with_consensus(
-                    path, consensus, thresholds,
-                    status_callback=self._status(index, "consensus"),
-                    settings=s,
-                )
-                elapsed = time.perf_counter() - started
-                self.success[index] = result
-                self.emit(("success", index, result, elapsed, False))
-                self.emit(("attempt_complete", elapsed))
-            except ConsensusRejected as exc:
-                log.info("%s: %s -> full alignment", path.name, exc)
-                self.emit(("stage", index, "Geometry differs - running full alignment", "consensus"))
-                self.standard(index, priors, phase="initial")
-            except Exception as exc:
-                elapsed = time.perf_counter() - started
-                log.info("%s: failed: %s", path.name, exc)
-                log.debug(traceback.format_exc())
-                self.pending_retry.append({
-                    "index": index,
-                    "path": path,
-                    "first_error": short_error(exc),
-                })
-                self.emit(("retry_queued", index, short_error(exc), elapsed))
-                self.emit(("attempt_complete", elapsed))
+        self._run_tasks([
+            {
+                "index": i, "phase": "consensus", "kind": "consensus",
+                "path": str(self.paths[i]), "settings": s,
+                "consensus": consensus, "thresholds": thresholds, "priors": priors,
+            }
+            for i in rest
+        ])
 
     def run_retry(self):
         if not self.pending_retry or self.stopped():
             return
         self.emit(("retry_begin", len(self.pending_retry)))
 
+        tasks = []
         for item in self.pending_retry:
-            if self.stopped():
-                return
             index = item["index"]
             priors = self.priors(nearest_success_alignments(self.success, index, self.history))
             if not priors:
@@ -603,29 +746,112 @@ class _Run:
                     0.0,
                 ))
                 continue
+            task = self._standard_task(index, "retry", priors)
+            task.update({"kind": "retry", "first_error": item["first_error"]})
+            tasks.append(task)
+        self._run_tasks(tasks)
 
-            self.emit(("file_start", index, item["path"].name, "retry"))
-            started = time.perf_counter()
+
+def _worker(task, status_callback=None):
+    """
+    Process one image. Runs in the main process (sequential mode) or in a
+    worker process; returns a picklable outcome dict and never raises.
+    """
+    import io
+
+    started = time.perf_counter()
+    capture = None
+    if task.get("capture_log"):
+        capture = io.StringIO()
+        handler = logging.StreamHandler(capture)
+        handler.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
+        level = logging.DEBUG if task.get("verbose") else logging.INFO
+        handler.setLevel(level)
+        root = logging.getLogger("msalign")
+        root.addHandler(handler)
+        root.setLevel(level)
+
+    outcome = {"ok": False}
+    try:
+        path = Path(task["path"])
+        settings = task["settings"]
+        if task["kind"] == "consensus":
             try:
-                result = process_single_file(
-                    item["path"],
-                    alignment_priors=priors,
-                    reuse_split=True,
-                    status_callback=self._status(index, "retry"),
-                    settings=self.settings,
+                result = process_with_consensus(
+                    path, task["consensus"], task["thresholds"],
+                    status_callback=status_callback, settings=settings,
                 )
-                elapsed = time.perf_counter() - started
-                self.success[index] = result
-                self.emit(("success", index, result, elapsed, True))
-            except Exception as exc:
-                elapsed = time.perf_counter() - started
-                self.emit((
-                    "final_error",
-                    index,
-                    f"First pass: {item['first_error']} | History-guided retry: {short_error(exc)}",
-                    elapsed,
-                ))
-            self.emit(("attempt_complete", elapsed))
+            except ConsensusRejected as exc:
+                outcome["consensus_rejected"] = str(exc)
+                if status_callback:
+                    status_callback("Geometry differs - running full alignment")
+                result = process_single_file(
+                    path, alignment_priors=task["priors"],
+                    status_callback=status_callback, settings=settings,
+                )
+        else:
+            result = process_single_file(
+                path,
+                alignment_priors=task.get("priors"),
+                reuse_split=task["kind"] == "retry",
+                status_callback=status_callback,
+                settings=settings,
+            )
+        outcome.update(ok=True, result=result)
+    except Exception as exc:
+        log.debug(traceback.format_exc())
+        outcome.update(ok=False, error=short_error(exc))
+    finally:
+        outcome["elapsed"] = time.perf_counter() - started
+        if capture is not None:
+            logging.getLogger("msalign").removeHandler(handler)
+            outcome["log"] = capture.getvalue()
+    return outcome
+
+
+def resolve_workers(setting, count: int, raw_input: bool = True) -> int:
+    """
+    Number of worker processes. "auto": one per CPU core (one core left free),
+    limited by available memory (about 1.5 GB per RAW image, 0.6 GB per JPG/TIFF)
+    and by the number of images.
+    """
+    if count < 2:
+        return 1
+    if setting != "auto":
+        return max(1, min(int(setting), count))
+    cores = max(1, (os.cpu_count() or 2) - 1)
+    per_image = 1.5 if raw_input else 0.6
+    memory = available_memory_gb()
+    by_memory = max(1, int(memory / per_image)) if memory else cores
+    return max(1, min(cores, by_memory, 8, count))
+
+
+def available_memory_gb():
+    """Available physical memory in GB, or None if it cannot be determined."""
+    try:
+        if os.name == "nt":
+            import ctypes
+
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                            ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                            ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                            ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+            stat = MEMORYSTATUSEX()
+            stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+                return stat.ullAvailPhys / 1024 ** 3
+        meminfo = Path("/proc/meminfo")
+        if meminfo.exists():
+            for line in meminfo.read_text().splitlines():
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) / 1024 ** 2
+        pages, size = os.sysconf("SC_PHYS_PAGES"), os.sysconf("SC_PAGE_SIZE")
+        return pages * size / 1024 ** 3 * 0.5
+    except (OSError, ValueError, AttributeError):
+        return None
 
 
 def use_batch_mode(count: int, settings: dict) -> bool:
@@ -643,15 +869,24 @@ def run_pipeline(file_paths, emit=None, stop_event=None, settings=None,
     settings = settings or load_settings()
     emit = emit or (lambda event: None)
     paths = [Path(p) for p in file_paths]
+    if paths:
+        # one camera per run: band-file captures share the settings of the first
+        settings = band_settings(paths[0], settings)
 
     files = RunFiles(paths[0].parent, verbose) if (run_files and paths) else None
-    run = _Run(paths, emit, stop_event, settings, files)
+    workers = resolve_workers(settings["workers"], len(paths), any(is_raw_file(p) for p in paths))
+    run = _Run(paths, emit, stop_event, settings, files, workers=workers, verbose=verbose)
     total = len(paths)
 
     try:
         if files is not None:
             emit(("run_files", str(files.log_path), str(files.summary_path)))
-        log.info("msalign run: %d image(s), settings from %s", total, settings.get("_source", "?"))
+        log.info("msalign run: %d image(s), %d worker process(es), settings from %s",
+                 total, workers, settings.get("_source", "?"))
+        emit(("workers", workers))
+        if settings["metashape_export"] and paths:
+            write_rig_helpers(paths[0].parent / RIG_DIR_NAME, settings,
+                              master_label=nearest_band(settings["output_order"]))
         if use_batch_mode(total, settings):
             emit(("mode", "Batch consensus mode"))
             run.run_batch()

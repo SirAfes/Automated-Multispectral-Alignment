@@ -110,6 +110,7 @@ def settings():
             "batch_threshold": 8,
             "batch_calibration_samples": 5,
             "batch_min_successful_samples": 4,
+            "workers": 1,
         },
     )
 

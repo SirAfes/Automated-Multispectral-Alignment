@@ -24,6 +24,7 @@ Closure check
 
 from pathlib import Path
 import csv
+import json
 import logging
 
 import cv2
@@ -36,7 +37,8 @@ from .fallback import estimate_xy_plan_b
 from .image_io import find_split_set
 from .layout import LensLayout, layout_from_settings
 from .matching import PreparedImages
-from .metadata import build_metadata, tiff_tags, write_sidecar
+from .exports import write_envi
+from .metadata import EXIF_PLACEHOLDER, append_exif_ifd, build_metadata, tiff_tags, write_sidecar
 from . import parallax
 from .parallax import _crop as parallax_crop
 from .settings import DEFAULT_SETTINGS, file_bands_int
@@ -471,6 +473,8 @@ def write_alignment_quality_report(output_tiff: Path, export_result):
                 f"{a['worst_p90_px']} px, median {b['median_px']} -> {a['median_px']} px"
             )
         else:
+            if local.get("parallax_reason"):
+                lines.append(f"Parallax correction: not applied ({local['parallax_reason']})")
             lines.append(
                 f"Local residual (tile check): median {local['median_px']} px, worst lens p90 "
                 f"{local['worst_p90_px']} px"
@@ -489,11 +493,17 @@ def write_alignment_quality_report(output_tiff: Path, export_result):
 
     split_info = export_result.get("split_info") or {}
     if split_info:
+        expected = (
+            f" (expected {split_info['expected_width']}x{split_info['expected_height']})"
+            if split_info.get("expected_width") else ""
+        )
         lines.append(
-            f"Source size: {split_info.get('source_width')}x{split_info.get('source_height')} "
-            f"(expected {split_info.get('expected_width')}x{split_info.get('expected_height')}), "
+            f"Source size: {split_info.get('source_width')}x{split_info.get('source_height')}{expected}, "
             f"split mode: {split_info.get('split_mode')}"
         )
+        if split_info.get("normalisation"):
+            lines.append(f"Band files: {', '.join(split_info.get('band_files', []))}; "
+                         f"normalisation: {split_info['normalisation']}")
 
     batch = alignment.get("batch_consensus")
     if batch:
@@ -640,6 +650,13 @@ def _local_alignment(images, shifts, band_map, output_order, layout, win, settin
             axis=0,
         ).astype(np.float32)
 
+    if settings["parallax_correction"] and layout.free:
+        residuals = parallax.check_only(crops, settings)
+        summary = parallax.summarise(residuals)
+        return {"mode": "check", "residuals": _clean_residuals(residuals), **summary,
+                "parallax_applied": False,
+                "parallax_reason": "lens positions unknown for this camera; parallax correction needs a lens grid"}
+
     if not settings["parallax_correction"]:
         residuals = parallax.check_only(crops, settings)
         summary = parallax.summarise(residuals)
@@ -684,34 +701,49 @@ def _quality_brief(alignment_result):
 
 
 def write_tiff(path: Path, data, meta, output_order, settings):
+    """
+    Write the aligned stack.
+
+    "multipage" (default): one single-band page per band, like the cameras'
+    own multispectral TIFFs (Agrowing) - the layout Agisoft Metashape offers
+    as a multispectral / multi-camera image. "multiband": one image with all
+    bands as samples, which GDAL / QGIS read as one multiband raster.
+    In both, page 1 carries the camera tags, GDAL band metadata, the full
+    metadata JSON and a standard EXIF block (focal length, pixel size,
+    exposure), which photogrammetry software reads.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     tags = tiff_tags(meta)
     compression = "zlib" if settings["tiff_compression"] == "deflate" else None
-    common = {
+    first = {
         "software": tags["software"],
-        "extratags": tags["extratags"],
+        "extratags": tags["extratags"] + [EXIF_PLACEHOLDER],
         "compression": compression,
+        "description": tags["description"],
+        "metadata": None,
     }
     if tags["datetime"]:
-        common["datetime"] = tags["datetime"]
+        first["datetime"] = tags["datetime"]
 
     if settings["tiff_layout"] == "multiband":
-        tifffile.imwrite(
-            str(path), data,
-            photometric="minisblack", planarconfig="separate",
-            description=tags["description"], metadata=None,
-            **common,
-        )
-        return
-
-    # legacy: one page per band; camera tags and band information on page 1
-    with tifffile.TiffWriter(str(path)) as tif:
-        for i, label in enumerate(output_order):
-            extra = common if i == 0 else {"compression": compression}
-            tif.write(
-                data[i], photometric="minisblack", contiguous=False,
-                metadata={"band_name": label}, **extra,
-            )
+        tifffile.imwrite(str(path), data, photometric="minisblack", planarconfig="separate",
+                         bigtiff=False, **first)
+    else:
+        names = [b["name"] for b in meta["bands"]]
+        with tifffile.TiffWriter(str(path), bigtiff=False) as tif:
+            for i, label in enumerate(output_order):
+                page_name = (285, "s", 0, names[i], True)  # PageName = band name
+                if i == 0:
+                    kwargs = dict(first, extratags=first["extratags"] + [page_name])
+                else:
+                    kwargs = {
+                        "compression": compression,
+                        "description": json.dumps({"band_name": label}),
+                        "metadata": None,
+                        "extratags": [page_name],
+                    }
+                tif.write(data[i], photometric="minisblack", contiguous=False, **kwargs)
+    append_exif_ifd(path, meta)
 
 
 def output_window(shifts, lens_w, lens_h, settings):
@@ -897,6 +929,7 @@ def export_aligned_tiff(
         )
         output["local_alignment"]["parallax_map"] = parallax_path.name
     metadata_json = write_sidecar(output_tiff, meta) if settings["write_metadata_json"] else None
+    envi_files = write_envi(output_tiff, data, meta) if settings["envi_export"] else None
 
     output.pop("shifts")
     export_result = {
@@ -905,6 +938,7 @@ def export_aligned_tiff(
         "final_size": {"width": win["width"], "height": win["height"]},
         "output_tiff": str(output_tiff),
         "metadata_json": str(metadata_json) if metadata_json else "",
+        "envi": [str(f) for f in envi_files] if envi_files else [],
         "camera": meta["camera"],
         "split_info": split_info,
     }

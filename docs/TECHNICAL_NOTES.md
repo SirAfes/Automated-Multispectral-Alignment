@@ -153,7 +153,7 @@ The cost per consensus image is dominated by reading the file and writing the TI
 
 For the reference camera, the lens baseline (≈ 11.9 mm, one cell of 3168 px × 3.76 µm) and the effective focal length of 21.8 mm give a parallax of roughly 140 px per lens step at the 0.5 m minimum focus distance and close to 0 px at infinity. The shared area is then at least about 2534 − 2 × 140 ≈ 2250 px wide, so the default 2048 × 2048 window fits over the whole focus range with some margin for lens mounting offsets.
 
-**TIFF layout.** One image with `SamplesPerPixel` = number of bands, planar configuration *separate*, photometric *minisblack*. The earlier layout (one page per band) is available as `tiff_layout: multipage`; GDAL-based tools see only the first band of such a file.
+**TIFF layout.** One single-band page per band (`SamplesPerPixel` 1, photometric *minisblack*, `PageName` = band name), as in Agrowing's own multipage TIFFs; Agisoft Metashape offers such files as multispectral / multi-camera images, but not a single image with many samples. Page 1 carries the camera tags, GDAL band metadata, the metadata JSON and an EXIF sub-IFD (tag 34665: ExifVersion, DateTimeOriginal, ExposureTime, FNumber, ISO, FocalLength, FocalPlaneX/YResolution, LensModel), which photogrammetry software reads instead of the same values in the main directory. tifffile cannot write an EXIF sub-IFD, so a placeholder entry is written and patched into the 34665 pointer after the EXIF directory is appended. `tiff_layout: multiband` writes one image with all bands as samples (planar *separate*), which GDAL-based tools read as one multiband raster; they see only the first page of the multipage layout.
 
 **Tags.** `Make`, `Model`, `Software`, `DateTime` (acquisition time from EXIF), `ImageDescription` (the full metadata record as JSON), TIFF/EP `FocalLength` (37386) and `FocalPlaneXResolution` / `FocalPlaneYResolution` / `FocalPlaneResolutionUnit` (37390–37392, pixels per cm), `GDAL_METADATA` (42112) with dataset items (`CAMERA_MODEL`, `LENS`, `FOCAL_LENGTH_MM`, `PIXEL_SIZE_UM`, …) and per-band items (`DESCRIPTION` with role *description*, `CENTRAL_WAVELENGTH_UM` and `FWHM_UM` in the `IMAGERY` domain, `wavelength`, `fwhm`, `LENS`, `SENSOR_CHANNEL`), and `GDAL_NODATA` (42113) only when padding occurred.
 
@@ -189,6 +189,34 @@ Validation on DSC05928 (2350 × 2451 px output, all six lenses): median residual
 
 Related approaches: Tommaselli et al. (ISPRS Archives XLVIII-G-2025) register close-range multi-lens images pixel-wise via a DSM and orthoimages per band, reaching about 1.5 px, but require a rigorous camera calibration. MicaSense's band alignment uses one homography per band and notes it fails when depth parallax is significant.
 
+## Band-file cameras (one file per band)
+
+Multi-camera rigs such as MicaSense RedEdge / Altum write one single-band file per band and capture (`IMG_0001_1.tif` … `IMG_0001_5.tif`). `rig_input.py` groups them by `band_file_pattern` (default `^(?P<capture>.+)_(?P<band>\d+)$`); with `input_mode: auto` a file is treated as a band file if its name matches, its capture has at least three such files and it is a single-band TIFF. A run uses the camera of its first capture for all captures.
+
+**Normalisation.** Each band has its own lens and sensor. When every band file carries `PerspectiveFocalLength`, `PrincipalPoint` (both in mm; converted with the EXIF focal-plane resolution) and `PerspectiveDistortion` (MicaSense order k1, k2, k3, p1, p2), every band is resampled into the ideal camera of the reference band — the band the `RigRelatives` refer to (`RigRelativesReferenceRigCameraIndex`) — with `cv2.initUndistortRectifyMap(K_band, distortion, R_band, K_reference)`. `R_band` is built from `RigRelatives` (degrees about x, y, z; `rig_rotation`). What is left is a translation per band (and depth parallax), which the normal alignment handles.
+
+The rotation convention was chosen by measurement, not assumed. Local residual check (median / worst lens 90th percentile, px) on two public MicaSense RedEdge-MX sample captures:
+
+| | IMG_0001 | IMG_0020 |
+|---|---|---|
+| bands as recorded, translation only | 1.50 / 3.61 | 1.46 / 4.85 |
+| undistorted to the reference camera | 0.86 / 2.52 | 0.61 / 1.63 |
+| + rig rotations (sign as recorded) | 1.09 / 1.86 | 0.38 / 1.06 |
+| + rig rotations (opposite sign) | 0.99 / 2.89 | 1.13 / 2.93 |
+| full msalign run (normalisation + alignment) | 0.38 / 0.80 (closure pass) | 0.37 / 0.78 (closure pass) |
+
+The order of the three axis rotations made no measurable difference at these small angles (≤ 0.6°).
+
+**Layout.** The physical lens positions are not recorded, so the lenses form a *free* layout: every lens is aligned directly to the reference, all lens pairs are checked by the closure check, search windows are symmetric, and depth parallax correction is skipped with a note in the report (it needs the baseline directions). Bands of a different resolution (e.g. the thermal band of an Altum) are not supported yet.
+
+## Photogrammetry export
+
+The aligned TIFF suits band analysis (indices, classification). For 3D reconstruction it is the wrong input: each band has been shifted — and with `parallax_correction` warped — to match the others, so the stack is no longer a central projection of one camera, and the crop origin can vary per image. Structure-from-motion software needs geometrically untouched images.
+
+`metashape_export` therefore writes, for every capture, each band's *unaligned* lens image (the same centred lens crop for every capture, so each lens keeps a constant principal point) into `metashape/<NN>_<wavelength>/<capture>.tif`. Agisoft's documented multi-camera loading uses exactly this layout: one folder per band, equal file counts, added with Add Folder as a multi-camera system. Each lens band then becomes a sensor of a fixed rig; the bundle adjustment solves the relative lens poses once and models depth parallax through the 3D geometry, which per-image 2D alignment cannot do.
+
+Metadata per file: Make/Model (EXIF of the source), TIFF/EP FocalLength and FocalPlaneX/YResolution (pixel size), and an XMP packet with the `Camera` namespace tags BandName, CentralWavelength, WavelengthFWHM, RigName, RigCameraIndex and a CaptureUUID shared by the bands of one capture (namespace and formats as specified by Pix4D for rig cameras). Whether a given program reads the focal length and pixel size from these tags varies; the folder's README lists the values to enter in Metashape's Camera Calibration if needed, and recommends a bright band (nearest 550 nm) as master.
+
 ## RAW decoding
 
 RAW files are decoded with LibRaw (rawpy) with white balance off, no colour matrix, linear response, no auto-brightening and 16-bit output. Two further choices:
@@ -206,6 +234,16 @@ Measured on a 9504 × 6336 px synthetic compound image (one CPU core, without RA
 |---|---|---|
 | Primary alignment (5 pairs) | ~59 s | ~2 s |
 | Whole image | ~60 s | ~2.5 s |
+
+### Parallel processing
+
+With `workers` > 1 (default `auto`: CPU cores − 1, at most 8, limited to about 1.5 GB of free memory per RAW image and 0.6 GB per JPG/TIFF), images are processed in separate processes (spawn start method, also used by the Windows executable via `multiprocessing.freeze_support()`). Two 61 MP synthetic images per pair of cores: 3.8 s → 2.2 s per image with two workers on a two-core machine.
+
+- **Same results, independent of timing:** in the first pass, images get no history priors, so the result of an image never depends on which other image happened to finish first. History-guided retries run in the second pass, after the first pass is complete. With `workers: 1` everything runs in order as before, including history priors from the previous images.
+- **Logs:** each worker's log is returned with its result and written to the run log, prefixed with the image name.
+- **Robustness:** if a worker process dies (for example when memory runs out), the images still in progress or waiting are processed one after the other in the main process; the run continues.
+- **Cancel:** no new images are started; images already running finish.
+- The executable's `--self-test` starts a worker process, so a build in which parallel processing cannot start is never published.
 
 The primary method's local search evaluated its NCC with one NumPy call per candidate offset (≈ 230 000 calls per image). It now uses one `cv2.matchTemplate` (`TM_CCOEFF_NORMED`, the same zero-mean NCC) per patch; a test checks that both give identical shifts. Intensity percentiles for normalisation are taken from a regular pixel subsample.
 

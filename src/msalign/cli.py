@@ -65,6 +65,9 @@ def build_parser():
 
 
 def main(argv=None) -> int:
+    import multiprocessing
+
+    multiprocessing.freeze_support()
     # --list-settings works without inputs
     argv = sys.argv[1:] if argv is None else argv
     if "--list-settings" in argv:
@@ -94,7 +97,7 @@ def main(argv=None) -> int:
     root.addHandler(console)
     root.setLevel(logging.DEBUG if args.verbose else logging.INFO)
 
-    files = expand_inputs(args.inputs)
+    files = expand_inputs(args.inputs, settings)
     missing = [f for f in files if not f.is_file()]
     if missing:
         print(f"Not found: {', '.join(map(str, missing))}", file=sys.stderr)

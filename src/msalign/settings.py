@@ -34,6 +34,18 @@ DEFAULT_SETTINGS = {
     "center_crop_frac": 0.80,
     "jpeg_quality": 100,
 
+    # --- Input type -----------------------------------------------------------
+    # "compound": one image holds all lenses (Agrowing and similar);
+    # "band_files": one file per band per capture (MicaSense RedEdge / Altum:
+    #     IMG_0001_1.tif ... IMG_0001_5.tif), see rig_input.py;
+    # "auto": band files are recognised by name (band_file_pattern), at least
+    #     three bands per capture and single-band TIFFs.
+    "input_mode": "auto",
+    "band_file_pattern": r"^(?P<capture>.+)_(?P<band>\d+)$",
+    # Apply the per-band rig rotations recorded by the camera (RigRelatives)
+    # when mapping band files into the reference camera.
+    "rig_rotation": True,
+
     # --- Camera RAW decoding ----------------------------------------------
     # "linear": bilinear demosaicing from same-colour neighbours only (keeps
     # spectral bands separate); "ahd": LibRaw's default, correlation-based
@@ -143,13 +155,23 @@ DEFAULT_SETTINGS = {
     # An image whose shared area is smaller than the window by more than this
     # many pixels on any side fails instead of being written.
     "output_max_padding_px": 0,
-    # "multiband": one image with N bands (GDAL / QGIS / ENVI read all bands);
-    # "multipage": one page per band (format of msalign < 1.1).
-    "tiff_layout": "multiband",
+    # "multipage": one single-band page per band, like the cameras' own
+    #     multispectral TIFFs; Agisoft Metashape loads these as multispectral
+    #     images (default);
+    # "multiband": one image with all bands, read as one multiband raster by
+    #     GDAL / QGIS (QGIS shows only the first page of a multipage TIFF).
+    "tiff_layout": "multipage",
     # "none" or "deflate" (lossless, smaller files).
     "tiff_compression": "none",
     # Also write <name>_metadata.json next to the TIFF.
     "write_metadata_json": True,
+    # Also write the aligned stack as ENVI (<name>.img + .hdr, band sequential)
+    # with wavelengths, for ENVI and hyperspectral software.
+    "envi_export": False,
+    # Also write the UNALIGNED lens images, one folder per band, for 3D
+    # reconstruction in Agisoft Metashape and similar software (multi-camera
+    # rig layout, see exports.py). <source folder>/metashape/
+    "metashape_export": False,
 
     # --- Outputs ------------------------------------------------------------
     # Second copy of every final TIFF in <source folder>/tiff.
@@ -158,6 +180,12 @@ DEFAULT_SETTINGS = {
     #   "copy":     independent copy
     #   "off":      no second copy
     "collection_mode": "hardlink",
+
+    # --- Speed --------------------------------------------------------------
+    # Images processed at the same time in separate processes: "auto" (one
+    # per CPU core minus one, limited by free memory: ~1.5 GB per RAW image)
+    # or a number. 1 = one after the other, as in versions before 1.3.
+    "workers": "auto",
 
     # --- Per-image history (standard mode) ----------------------------------
     "history_length": 5,
@@ -278,6 +306,21 @@ def validate_settings(settings: dict) -> dict:
         if max(size) > lens:
             raise ValueError(f"output_size_px {list(size)} is larger than a lens image ({lens} px)")
 
+    w = settings["workers"]
+    if not (w == "auto" or (isinstance(w, int) and not isinstance(w, bool) and w >= 1)):
+        raise ValueError("workers must be \"auto\" or a whole number >= 1")
+
+    if settings["input_mode"] not in {"auto", "compound", "band_files"}:
+        raise ValueError("input_mode must be 'auto', 'compound' or 'band_files'")
+    try:
+        import re as _re
+
+        pattern = _re.compile(settings["band_file_pattern"])
+    except Exception as exc:
+        raise ValueError(f"band_file_pattern is not a valid regular expression: {exc}") from exc
+    if not {"capture", "band"} <= set(pattern.groupindex):
+        raise ValueError("band_file_pattern needs the groups (?P<capture>...) and (?P<band>...)")
+
     if settings["raw_demosaic"] not in {"linear", "ahd"}:
         raise ValueError("raw_demosaic must be 'linear' or 'ahd'")
 
@@ -342,6 +385,25 @@ def channel_labels(entry, lens="?") -> tuple[str, str, str]:
     raise ValueError(
         f"file_bands['{lens}'] must be {{\"R\": .., \"G\": .., \"B\": ..}} or a list [R, G, B]"
     )
+
+
+def save_user_settings(updates: dict, path: Path | None = None) -> Path:
+    """
+    Merge `updates` into pipeline_config.json (next to the program by default),
+    keeping everything else in the file. The result is validated before it is
+    written. Returns the path.
+    """
+    path = path or (_base_dir() / CONFIG_FILENAME)
+    data = {}
+    if path.is_file():
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+    data.update(updates)
+    validate_settings(_merge(DEFAULT_SETTINGS, data))  # unknown or invalid values raise here
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    tmp.replace(path)
+    return path
 
 
 def file_bands_int(settings: dict) -> dict[int, tuple[str, str, str]]:

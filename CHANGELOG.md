@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- One-file-per-band cameras (MicaSense RedEdge / Altum and similar): band files are grouped into captures, mapped into the reference band's undistorted camera with the per-band lens calibration and rig rotations from XMP, then aligned, checked and exported like compound images. Band names, wavelengths and FWHM come from the files. On MicaSense RedEdge-MX samples: local misalignment 1.5 / 3.6-4.9 px -> 0.4 / 0.8 px (median / worst 90th percentile).
+
+- Desktop app: check boxes for depth parallax correction, the Metashape export and the ENVI export, with an option to remember them in `pipeline_config.json`.
+
+- Photogrammetry export (`metashape_export`): unaligned single-band lens images, one folder per band, in the multi-camera layout Agisoft Metashape loads with Add Folder; focal length, pixel size and XMP Camera band/rig tags in every file; README and a Metashape Pro loading script in the folder.
+- ENVI export (`envi_export`): band-sequential `.img` + `.hdr` with band names, wavelengths and FWHM.
+
+- Parallel processing (`workers`, default `auto`): images are processed in separate processes, sized to CPU cores and free memory. First-pass results do not depend on processing order; if a worker process dies, the run continues one image at a time. 1.75x faster with two workers on two cores.
+
+### Fixed
+
+- Agisoft Metashape no longer offered the multispectral / multi-camera layout for the aligned TIFF (since 1.1). The default TIFF is again one page per band (`tiff_layout: multipage`), like Agrowing's own multispectral TIFFs; `multiband` remains available for GDAL / QGIS.
+- Focal length, pixel size and exposure are also written as a standard EXIF block, where Metashape and other photogrammetry software read them; previously they were only in the main TIFF directory. Applies to the Metashape export too.
+- Windows executable failed at start with "No module named 'msalign'" (since 1.0); the build now runs the executable's self-test.
+
 ## 1.2.0
 
 ### Added

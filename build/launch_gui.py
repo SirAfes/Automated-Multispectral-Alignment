@@ -31,6 +31,15 @@ def self_test(report_path):
         lines.append(f"tifffile {tifffile.__version__}")
         import tkinter  # noqa: F401
         lines.append("tkinter: ok")
+
+        import concurrent.futures
+        import multiprocessing
+        import os
+
+        ctx = multiprocessing.get_context("spawn")
+        with concurrent.futures.ProcessPoolExecutor(1, mp_context=ctx) as pool:
+            child = pool.submit(os.getpid).result(timeout=120)
+        lines.append(f"worker process: ok (pid {child})")
     except Exception as exc:  # report anything that would stop the program
         ok = False
         import traceback
@@ -42,6 +51,13 @@ def self_test(report_path):
 
 
 if __name__ == "__main__":
+    # Must come first: in the frozen EXE, worker processes for parallel
+    # processing start this same program; freeze_support() turns them into
+    # workers instead of opening another window.
+    import multiprocessing
+
+    multiprocessing.freeze_support()
+
     if len(sys.argv) >= 3 and sys.argv[1] == "--self-test":
         sys.exit(self_test(sys.argv[2]))
 

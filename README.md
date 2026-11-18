@@ -20,7 +20,10 @@ Compound image (JPG / TIFF / camera RAW)
 Aligned multiband TIFF  +  quality report (TXT / CSV)
 ```
 
-The reference configuration is a 3 × 2 six-lens camera with 14 bands from 405 to 850 nm. Any rectangular lens array (2 × 2, 4 × 4, 1 × 5, …) and any band mapping can be set up in a [settings file](#configuration).
+Two kinds of cameras are supported:
+
+- **Multi-lens cameras with one sensor** that record all lenses in one compound image. The reference configuration is a 3 × 2 six-lens camera (Agrowing Sextuple) with 14 bands from 405 to 850 nm; any rectangular lens array (2 × 2, 4 × 4, 1 × 5, …) and band mapping can be set up in a [settings file](#configuration).
+- **Multi-camera rigs that write one file per band**, such as MicaSense RedEdge / Altum (`IMG_0001_1.tif` … `IMG_0001_5.tif`). Each band is first mapped into one common camera using the lens calibration the camera records per band, then aligned the same way (see [Band-file cameras](#band-file-cameras)).
 
 ## Contents
 
@@ -63,6 +66,8 @@ Start the `.exe` or `msalign-gui`. Choose **Select images…** or **Select a who
 
 When a folder holds both the RAW and the JPG of a shot, only the RAW is used. Subfolders (for example earlier outputs) are not scanned.
 
+The start window also has check boxes for the optional steps: depth parallax correction, lens images for 3D software (Metashape) and ENVI files. With *Remember these options* they are saved to `pipeline_config.json` next to the program.
+
 ### Command line
 
 ```bash
@@ -99,7 +104,7 @@ D:/survey/
     └── 20261105_141502_summary.csv                           ← one row per image
 ```
 
-- **Multiband TIFF:** one image with all bands in the configured wavelength order, the same size for every image (2048 × 2048 px for the reference camera). 8-bit for JPG input, 16-bit for RAW input. GDAL, QGIS, rasterio and ENVI read it as one multiband raster.
+- **Multispectral TIFF:** one single-band page per band in the configured wavelength order, like the camera makers' own multispectral TIFFs, the same size for every image (2048 × 2048 px for the reference camera). 8-bit for JPG input, 16-bit for RAW input. Agisoft Metashape loads it as a multispectral image (Add Photos > *Multi-camera system*); camera, focal length, pixel size and exposure are in a standard EXIF block. For GDAL / QGIS / rasterio, set `tiff_layout: multiband` (one image with all bands) or use the ENVI export.
 - **Metadata in the TIFF:** camera make and model, lens, focal length and pixel size; for every band its name (`405 nm`), centre wavelength, band width, lens and sensor channel; and the processing record (msalign version, alignment mode, lens shifts, crop position). See [Metadata](#metadata).
 - **`tiff/` folder:** a hard link by default — the same file under a second name, using no extra disk space. Can be switched to a real copy or off.
 - **Quality report:** for every lens pair the method, shift, support and confidence, plus the [closure check](#closure-check).
@@ -114,7 +119,21 @@ RAW outputs carry the RAW extension in their name (`DSC06664_ARW`), so the RAW a
 | Standard | `.jpg` `.jpeg` `.png` `.tif` `.tiff` | 8-bit |
 | Camera RAW | `.arw` `.raw` `.dng` `.nef` `.cr2` `.cr3` `.orf` `.rw2` `.raf` `.pef` `.srw` | 16-bit |
 
+| Band files (one per band) | `<capture>_<band>.tif`, single-band TIFF | same as input (16-bit for MicaSense) |
+
 RAW files are decoded with [rawpy](https://github.com/letmaik/rawpy) / LibRaw as close to the sensor data as possible: no white balance, no camera colour matrix, linear response, no automatic brightening. Each sensor channel stays a separate spectral measurement. For quantitative work, prefer RAW: camera JPGs are 8-bit, lossy, and their colour processing mixes the channels.
+
+### Other formats
+
+- **ENVI** (`"envi_export": true`): `<name>.img` + `<name>.hdr`, band sequential, with band names, wavelengths and FWHM — for ENVI, GDAL/QGIS and hyperspectral libraries such as Spectral Python.
+- **3D reconstruction / photogrammetry** (`"metashape_export": true`): the aligned TIFF is made for band analysis, not for 3D software. Its bands are shifted to match each other, so it is no longer one camera's projection. This export writes the *unaligned* lens images, one folder per band, so Agisoft Metashape (Workflow → Add Folder → *Multi-camera system*) treats every lens as a camera of a fixed rig and solves the geometry — including depth parallax — in 3D. The files carry focal length, pixel size and the XMP band/rig tags (BandName, CentralWavelength, WavelengthFWHM, RigName, RigCameraIndex, CaptureUUID). The folder also gets a `README.txt` with the steps and a `load_in_metashape.py` script for Metashape Pro.
+
+```text
+metashape/
+├── 01_405nm/DSC05928.tif  …  14_850nm/DSC05928.tif
+├── README.txt
+└── load_in_metashape.py
+```
 
 ## Metadata
 
@@ -142,8 +161,13 @@ All settings have defaults for the reference camera. To change them, copy [`pipe
 | `camera` | Agrowing Sextuple | Lens, focal length, pixel size and band width written into the TIFF |
 | `output_size_px` | [2048, 2048] | Fixed output size; `null` = largest area all lenses share |
 | `output_anchor` | `common_area_center` | Position of the output window (see [Output size](#output-size)) |
-| `tiff_layout` | `multiband` | `multiband`, or `multipage` (one page per band, as before 1.1) |
+| `tiff_layout` | `multipage` | `multipage` (one page per band; Metashape multispectral), or `multiband` (one image with all bands; GDAL / QGIS) |
 | `tiff_compression` | `none` | `none` or `deflate` (lossless, smaller files) |
+| `workers` | `auto` | Images processed at the same time (one per CPU core minus one, limited by free memory); `1` = one after the other |
+| `envi_export` | `false` | Also write the aligned stack as ENVI `.img` + `.hdr` |
+| `metashape_export` | `false` | Also write the unaligned lens images in a multi-camera layout for 3D software |
+| `input_mode` | `auto` | `compound`, `band_files` (one file per band) or `auto` |
+| `rig_rotation` | `true` | Band files: apply the per-band rig rotations recorded by the camera |
 | `parallax_correction` | `false` | Depth-dependent correction with a shared disparity map (see [Depth parallax](#depth-parallax)) |
 | `raw_demosaic` | `linear` | `linear` keeps spectral bands separate; `ahd` is LibRaw's default |
 | `parallax_range_px` | [20, 360] | Expected shift between adjacent lenses along their baseline |
@@ -193,6 +217,14 @@ The alignment measures only some lens pairs directly; all other relative shifts 
 - **measured pairs** — re-checked with the same metric, so every shift is judged on the same scale.
 
 A pair fails when the best local match is not at the implied shift, or when the implied shift has far weaker support than the other pairs of the same image. With `closure_check: reject` (default) a failed check sends the image to the next stage; with `warn` it is only reported and the quality is set to *low*. The report lists every checked pair with residual and correlation.
+
+### Band-file cameras
+
+Selecting a folder (or the files) of a camera such as MicaSense RedEdge is enough: files named `<capture>_<band>.tif` with at least three single-band TIFFs per capture are recognised automatically (`input_mode`, `band_file_pattern`), and every capture is processed as one image (`IMG_0001/IMG_0001_aligned_multiband.tif`).
+
+Unlike a single-sensor multi-lens camera, every band has its own lens: slightly different focal length, principal point, distortion and orientation. MicaSense records these per band (XMP `PerspectiveFocalLength`, `PrincipalPoint`, `PerspectiveDistortion`, `RigRelatives`); msalign uses them to map every band into the reference band's undistorted camera before the alignment. Band names, wavelengths and band widths are taken from the files. On two MicaSense RedEdge-MX sample captures, the local misalignment (median / worst 90th percentile) went from 1.5 / 3.6 px and 1.5 / 4.9 px as recorded to **0.4 / 0.8 px** after msalign.
+
+The lens positions of such rigs are not recorded, so depth parallax correction is not available for them (the residual check still runs). For 3D reconstruction, load the original files into your photogrammetry software as a multi-camera system.
 
 ### Depth parallax
 

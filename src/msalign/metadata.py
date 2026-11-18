@@ -335,3 +335,100 @@ def write_sidecar(output_tiff: Path, meta: dict) -> Path:
     path = output_tiff.with_name(output_tiff.stem + "_metadata.json")
     path.write_text(json.dumps(meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     return path
+
+
+# ---------------------------------------------------------------------------
+# EXIF sub-IFD
+# ---------------------------------------------------------------------------
+#
+# Photogrammetry software (e.g. Agisoft Metashape) reads focal length, pixel
+# size and exposure from the standard EXIF block (a sub-IFD referenced by tag
+# 34665), as cameras and Agrowing's own software write it - not from the same
+# values placed directly in the main image directory. tifffile cannot write an
+# EXIF sub-IFD (it refuses tag 34665), so the TIFF is written with a
+# placeholder tag 34664 (unassigned, sorts directly before 34665); the EXIF
+# directory is then appended to the file and the placeholder entry is turned
+# into a 34665 pointer to it.
+
+_EXIF_PLACEHOLDER_CODE = 34664
+EXIF_PLACEHOLDER = (_EXIF_PLACEHOLDER_CODE, "I", 1, 0, True)
+
+_ASCII, _SHORT, _LONG, _RATIONAL, _UNDEFINED = 2, 3, 4, 5, 7
+
+
+def exif_entries(meta: dict) -> list:
+    """[(tag, type, count, value)] for the EXIF directory, sorted by tag."""
+    cam, acq = meta.get("camera", {}), meta.get("acquisition", {})
+    entries = [(36864, _UNDEFINED, 4, b"0232")]  # ExifVersion
+    if acq.get("exposure_time_s"):
+        entries.append((33434, _RATIONAL, 1, _rational_tag(float(acq["exposure_time_s"]))))
+    if acq.get("f_number"):
+        entries.append((33437, _RATIONAL, 1, _rational_tag(float(acq["f_number"]))))
+    if acq.get("iso"):
+        entries.append((34855, _SHORT, 1, int(acq["iso"])))
+    dto = acq.get("datetime_original")
+    if dto and re.fullmatch(r"\d{4}:\d\d:\d\d \d\d:\d\d:\d\d", str(dto)):
+        entries.append((36867, _ASCII, 20, str(dto).encode() + b"\x00"))
+    if cam.get("focal_length_mm"):
+        entries.append((37386, _RATIONAL, 1, _rational_tag(float(cam["focal_length_mm"]))))
+    pixel = cam.get("pixel_size_um_output") or cam.get("pixel_size_um")
+    if pixel:
+        per_cm = _rational_tag(10000.0 / float(pixel))
+        entries += [(41486, _RATIONAL, 1, per_cm), (41487, _RATIONAL, 1, per_cm), (41488, _SHORT, 1, 3)]
+    if cam.get("lens"):
+        text = str(cam["lens"]).encode("ascii", "replace") + b"\x00"
+        entries.append((42036, _ASCII, len(text), text))
+    return sorted(entries)
+
+
+def append_exif_ifd(path, meta: dict) -> bool:
+    """
+    Append an EXIF directory to the TIFF at `path` and turn the placeholder
+    tag on page 1 into an ExifIFD (34665) pointer to it. Returns False if
+    there is no placeholder.
+    """
+    import tifffile
+
+    path = Path(path)
+    with tifffile.TiffFile(str(path)) as tif:
+        if tif.is_bigtiff:
+            raise ValueError("EXIF directory: BigTIFF is not supported")
+        tag = tif.pages[0].tags.get(_EXIF_PLACEHOLDER_CODE)
+        if tag is None or 34665 in tif.pages[0].tags:
+            return False
+        entry_offset, value_offset = tag.offset, tag.valueoffset
+        bo = "<" if tif.byteorder == "<" else ">"
+
+    entries = exif_entries(meta)
+    with path.open("r+b") as f:
+        f.seek(0, 2)
+        start = f.tell()
+        start += start % 2  # word aligned
+        n = len(entries)
+        data_at = start + 2 + 12 * n + 4
+        ifd = bytearray(struct.pack(bo + "H", n))
+        extra = bytearray()
+        for code, typ, count, value in entries:
+            if typ == _RATIONAL:
+                raw = struct.pack(bo + "II", int(value[0]), int(value[1]))
+            elif typ == _SHORT:
+                raw = struct.pack(bo + "H", int(value)) + b"\x00\x00"
+            elif typ == _LONG:
+                raw = struct.pack(bo + "I", int(value))
+            else:  # ASCII / UNDEFINED
+                raw = bytes(value)
+            if len(raw) <= 4:
+                ifd += struct.pack(bo + "HHI", code, typ, count) + raw.ljust(4, b"\x00")
+            else:
+                ifd += struct.pack(bo + "HHII", code, typ, count, data_at + len(extra))
+                extra += raw + (b"\x00" if len(raw) % 2 else b"")
+        ifd += struct.pack(bo + "I", 0)
+        f.seek(0, 2)
+        if f.tell() % 2:
+            f.write(b"\x00")
+        f.write(bytes(ifd) + bytes(extra))
+        f.seek(entry_offset)
+        f.write(struct.pack(bo + "H", 34665))
+        f.seek(value_offset)
+        f.write(struct.pack(bo + "I", start))
+    return True
