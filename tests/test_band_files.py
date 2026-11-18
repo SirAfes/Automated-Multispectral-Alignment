@@ -128,9 +128,9 @@ def test_end_to_end_band_files(tmp_path, base):
     assert result["quality"] in {"high", "medium"} and result["closure_status"] == "pass"
     with tifffile.TiffFile(result["tiff"]) as t:
         page = t.pages[0]
-        data = page.asarray()
+        data = np.stack([p.asarray() for p in t.pages])
         tags = {tag.code: tag.value for tag in page.tags.values()}
-    assert data.shape[0] == 5 and data.dtype == np.uint16
+    assert len(t.pages) == 5 and data.shape[0] == 5 and data.dtype == np.uint16
     assert tags[271] == "TestCam" and tags[272] == "Rig-5"
     assert "<Item name=\"DESCRIPTION\" sample=\"4\" role=\"description\">842 nm</Item>" in tags[42112]
     assert "FWHM_UM" in tags[42112]

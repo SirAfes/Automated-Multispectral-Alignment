@@ -155,9 +155,12 @@ DEFAULT_SETTINGS = {
     # An image whose shared area is smaller than the window by more than this
     # many pixels on any side fails instead of being written.
     "output_max_padding_px": 0,
-    # "multiband": one image with N bands (GDAL / QGIS / ENVI read all bands);
-    # "multipage": one page per band (format of msalign < 1.1).
-    "tiff_layout": "multiband",
+    # "multipage": one single-band page per band, like the cameras' own
+    #     multispectral TIFFs; Agisoft Metashape loads these as multispectral
+    #     images (default);
+    # "multiband": one image with all bands, read as one multiband raster by
+    #     GDAL / QGIS (QGIS shows only the first page of a multipage TIFF).
+    "tiff_layout": "multipage",
     # "none" or "deflate" (lossless, smaller files).
     "tiff_compression": "none",
     # Also write <name>_metadata.json next to the TIFF.

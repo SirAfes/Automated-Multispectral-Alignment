@@ -39,7 +39,7 @@ import numpy as np
 import tifffile
 
 from . import __version__
-from .metadata import _rational_tag, band_records, camera_info
+from .metadata import EXIF_PLACEHOLDER, _rational_tag, append_exif_ifd, band_records, camera_info
 
 
 # ---------------------------------------------------------------------------
@@ -181,11 +181,15 @@ def write_rig_images(images: dict, band_map: dict, output_order, settings: dict,
         folder.mkdir(parents=True, exist_ok=True)
         tags = extratags + [(700, "B", 0, _xmp_packet(record, rig_name, capture_uuid), True)]
         kwargs = {"datetime": acquired} if acquired else {}
+        out = folder / f"{name}.tif"
         tifffile.imwrite(
-            str(folder / f"{name}.tif"), plane, photometric="minisblack", metadata=None,
+            str(out), plane, photometric="minisblack", metadata=None, bigtiff=False,
             description=f"msalign {__version__}: unaligned lens {lens} image, band {record['name']}",
-            software=f"msalign {__version__}", extratags=tags, **kwargs,
+            software=f"msalign {__version__}", extratags=tags + [EXIF_PLACEHOLDER], **kwargs,
         )
+        append_exif_ifd(out, {"camera": cam, "acquisition": {
+            k: exif[k] for k in ("datetime_original", "exposure_time_s", "f_number", "iso") if k in exif
+        }})
     return root
 
 

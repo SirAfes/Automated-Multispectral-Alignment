@@ -24,6 +24,7 @@ Closure check
 
 from pathlib import Path
 import csv
+import json
 import logging
 
 import cv2
@@ -37,7 +38,7 @@ from .image_io import find_split_set
 from .layout import LensLayout, layout_from_settings
 from .matching import PreparedImages
 from .exports import write_envi
-from .metadata import build_metadata, tiff_tags, write_sidecar
+from .metadata import EXIF_PLACEHOLDER, append_exif_ifd, build_metadata, tiff_tags, write_sidecar
 from . import parallax
 from .parallax import _crop as parallax_crop
 from .settings import DEFAULT_SETTINGS, file_bands_int
@@ -700,34 +701,49 @@ def _quality_brief(alignment_result):
 
 
 def write_tiff(path: Path, data, meta, output_order, settings):
+    """
+    Write the aligned stack.
+
+    "multipage" (default): one single-band page per band, like the cameras'
+    own multispectral TIFFs (Agrowing) - the layout Agisoft Metashape offers
+    as a multispectral / multi-camera image. "multiband": one image with all
+    bands as samples, which GDAL / QGIS read as one multiband raster.
+    In both, page 1 carries the camera tags, GDAL band metadata, the full
+    metadata JSON and a standard EXIF block (focal length, pixel size,
+    exposure), which photogrammetry software reads.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     tags = tiff_tags(meta)
     compression = "zlib" if settings["tiff_compression"] == "deflate" else None
-    common = {
+    first = {
         "software": tags["software"],
-        "extratags": tags["extratags"],
+        "extratags": tags["extratags"] + [EXIF_PLACEHOLDER],
         "compression": compression,
+        "description": tags["description"],
+        "metadata": None,
     }
     if tags["datetime"]:
-        common["datetime"] = tags["datetime"]
+        first["datetime"] = tags["datetime"]
 
     if settings["tiff_layout"] == "multiband":
-        tifffile.imwrite(
-            str(path), data,
-            photometric="minisblack", planarconfig="separate",
-            description=tags["description"], metadata=None,
-            **common,
-        )
-        return
-
-    # legacy: one page per band; camera tags and band information on page 1
-    with tifffile.TiffWriter(str(path)) as tif:
-        for i, label in enumerate(output_order):
-            extra = common if i == 0 else {"compression": compression}
-            tif.write(
-                data[i], photometric="minisblack", contiguous=False,
-                metadata={"band_name": label}, **extra,
-            )
+        tifffile.imwrite(str(path), data, photometric="minisblack", planarconfig="separate",
+                         bigtiff=False, **first)
+    else:
+        names = [b["name"] for b in meta["bands"]]
+        with tifffile.TiffWriter(str(path), bigtiff=False) as tif:
+            for i, label in enumerate(output_order):
+                page_name = (285, "s", 0, names[i], True)  # PageName = band name
+                if i == 0:
+                    kwargs = dict(first, extratags=first["extratags"] + [page_name])
+                else:
+                    kwargs = {
+                        "compression": compression,
+                        "description": json.dumps({"band_name": label}),
+                        "metadata": None,
+                        "extratags": [page_name],
+                    }
+                tif.write(data[i], photometric="minisblack", contiguous=False, **kwargs)
+    append_exif_ifd(path, meta)
 
 
 def output_window(shifts, lens_w, lens_h, settings):

@@ -69,6 +69,7 @@ def test_metashape_rig_export(tmp_path):
     assert "<rdf:li>710 nm</rdf:li>" in xmp and "<rdf:li>710</rdf:li>" in xmp
     assert "<Camera:RigCameraIndex>11</Camera:RigCameraIndex>" in xmp
     assert tags[37386] == (109, 5)
+    assert tags[34665]["FocalLength"] == (109, 5)  # EXIF block, read by Metashape
 
     def capture_uuid(path):
         with tifffile.TiffFile(path) as t:
